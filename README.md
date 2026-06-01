@@ -2,20 +2,18 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
----
+## Fork Release 说明
 
-<table>
-<tr>
-<td>
-<b>特别感谢</b>：<a href="https://co.yes.vg/register?ref=hank9999">YesCode</a> 为本项目提供了 AI API 额度赞助, YesCode 作为一家低调务实的 AI API 中转服务商 <br>
-长期以来提供稳定高可用的服务, 如您有意体验, 请点击链接注册体验 → <a href="https://co.yes.vg/register?ref=hank9999">立即访问</a>
-</td>
-</tr>
-</table>
+本仓库 fork 自 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs)。截至 2026-06-01，上游最近一次提交为 2026-05-29 的 Opus 4.8 支持；但最近半个月 Kiro 官方认证链路、账号导出字段和上游 token/cache usage 返回格式已有变化，上游尚未完整覆盖这些会直接影响可用性和用量统计的更新。
 
----
+本 fork 在保留原项目 Anthropic API 兼容代理能力的基础上，补齐了这批变更：
 
-#### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
+- 更新 Kiro 最新认证模式，兼容 Social / Builder ID / IdC / API Key，并按登录方式补默认 `profileArn`
+- 兼容 Kiro Account Manager 导出的新账号字段，支持批量导入时保留认证区域、API 区域、machineId 等信息
+- 解析 Kiro 上游 `messageMetadataEvent` / `metadataEvent` 中的 `tokenUsage`
+- 在 Anthropic 响应中返回 cache creation / cache read 统计，并避免把本地模拟值伪造成上游真实 TTL 明细
+- 修复普通 stream 首包 usage 与最终 usage 不一致的问题
+- 保留原项目 MIT License，移除上游 README 中的第三方推广内容
 
 ## 免责声明
 
