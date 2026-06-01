@@ -36,6 +36,7 @@ struct CacheUsageContext {
     cache_read_input_tokens: i32,
     cache_creation_5m_input_tokens: i32,
     cache_creation_1h_input_tokens: i32,
+    cache_creation_ttl_known: bool,
     prefix_hit_input_jitter: i32,
 }
 
@@ -58,6 +59,7 @@ fn compute_cache_usage(
         cache_read_input_tokens: result.cache_read_input_tokens,
         cache_creation_5m_input_tokens: result.cache_creation_5m_input_tokens,
         cache_creation_1h_input_tokens: result.cache_creation_1h_input_tokens,
+        cache_creation_ttl_known: true,
         prefix_hit_input_jitter: result.prefix_hit_input_jitter,
     }
 }
@@ -65,10 +67,12 @@ fn compute_cache_usage(
 fn inject_cache_usage_fields(usage: &mut serde_json::Value, cache_context: CacheUsageContext) {
     usage["cache_creation_input_tokens"] = json!(cache_context.cache_creation_input_tokens);
     usage["cache_read_input_tokens"] = json!(cache_context.cache_read_input_tokens);
-    usage["cache_creation"] = json!({
-        "ephemeral_5m_input_tokens": cache_context.cache_creation_5m_input_tokens,
-        "ephemeral_1h_input_tokens": cache_context.cache_creation_1h_input_tokens
-    });
+    if cache_context.cache_creation_ttl_known {
+        usage["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": cache_context.cache_creation_5m_input_tokens,
+            "ephemeral_1h_input_tokens": cache_context.cache_creation_1h_input_tokens
+        });
+    }
 }
 
 fn upstream_cache_context_from_token_usage(
@@ -79,8 +83,9 @@ fn upstream_cache_context_from_token_usage(
         CacheUsageContext {
             cache_creation_input_tokens: cache_write,
             cache_read_input_tokens: token_usage.cache_read_tokens(),
-            cache_creation_5m_input_tokens: cache_write,
+            cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: false,
             prefix_hit_input_jitter: 0,
         }
     })
@@ -117,6 +122,7 @@ fn scale_cache_context(
             cache_read_input_tokens: actual_input_tokens.saturating_sub(input_tokens),
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: cache_context.cache_creation_ttl_known,
             prefix_hit_input_jitter: cache_context.prefix_hit_input_jitter,
         };
     }
@@ -142,6 +148,7 @@ fn scale_cache_context(
             estimated_input_tokens,
             actual_input_tokens,
         ),
+        cache_creation_ttl_known: cache_context.cache_creation_ttl_known,
         prefix_hit_input_jitter: cache_context.prefix_hit_input_jitter,
     };
 
@@ -563,6 +570,7 @@ async fn handle_stream_request(
         cache_read_input_tokens: ctx.cache_read_input_tokens,
         cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
         cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+        cache_creation_ttl_known: ctx.cache_creation_ttl_known,
         prefix_hit_input_jitter: ctx.prefix_hit_input_jitter,
     });
 
@@ -1224,6 +1232,7 @@ async fn handle_stream_request_buffered(
         cache_read_input_tokens: ctx.cache_read_input_tokens,
         cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
         cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+        cache_creation_ttl_known: ctx.cache_creation_ttl_known,
         prefix_hit_input_jitter: ctx.prefix_hit_input_jitter,
     });
 

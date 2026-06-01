@@ -149,11 +149,10 @@ impl CacheTracker {
         prune_expired(&mut entries, now);
 
         let Some(credential_entries) = entries.get_mut(&credential_id) else {
-            let (cache_5m, cache_1h) =
-                compute_ttl_breakdown(profile, 0, profile.total_input_tokens);
+            let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, 0, last_breakpoint_tokens);
             return CacheResult {
                 cache_read_input_tokens: 0,
-                cache_creation_input_tokens: profile.total_input_tokens,
+                cache_creation_input_tokens: last_breakpoint_tokens,
                 cache_creation_5m_input_tokens: cache_5m,
                 cache_creation_1h_input_tokens: cache_1h,
                 prefix_hit_input_jitter: 0,
@@ -192,7 +191,7 @@ impl CacheTracker {
             };
         }
 
-        let creation_tokens = last_breakpoint_tokens.max(profile.total_input_tokens);
+        let creation_tokens = last_breakpoint_tokens;
         let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, 0, creation_tokens);
 
         CacheResult {
@@ -487,8 +486,7 @@ fn strip_cache_control(value: &mut serde_json::Value) {
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("opus")
-        && (model_lower.contains("4-8") || model_lower.contains("4.8"))
+    if model_lower.contains("opus") && (model_lower.contains("4-8") || model_lower.contains("4.8"))
     {
         1024
     } else if model_lower.contains("opus") {
@@ -594,6 +592,29 @@ mod tests {
         let second = tracker.compute(7, &profile);
         assert!(second.cache_read_input_tokens > 0);
         assert_eq!(second.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn cache_creation_stops_at_last_cacheable_breakpoint() {
+        let tracker = CacheTracker::new(Duration::from_secs(300));
+        let request = cacheable_request("cacheable prompt chunk ".repeat(3000));
+        let input_tokens = token::count_all_tokens(
+            request.model.clone(),
+            request.system.clone(),
+            request.messages.clone(),
+            request.tools.clone(),
+        ) as i32;
+        let profile = tracker.build_profile(&request, input_tokens + 500);
+        let last_cacheable_tokens = profile
+            .last_cacheable_breakpoint()
+            .expect("request should have a cacheable breakpoint")
+            .cumulative_tokens;
+
+        assert!(last_cacheable_tokens < profile.total_input_tokens);
+
+        let first = tracker.compute(7, &profile);
+        assert_eq!(first.cache_read_input_tokens, 0);
+        assert_eq!(first.cache_creation_input_tokens, last_cacheable_tokens);
     }
 
     #[test]

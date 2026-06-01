@@ -92,8 +92,8 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
+/// 优先匹配明确版本；没有明确 Kiro 版本的旧 Anthropic 别名映射到当前默认版本。
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -102,6 +102,14 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower.contains("sonnet-4")
+            || model_lower.contains("4-sonnet")
+            || model_lower.contains("sonnet-3-5")
+            || model_lower.contains("sonnet-3.5")
+            || model_lower.contains("3-5-sonnet")
+            || model_lower.contains("3.5-sonnet")
+        {
+            Some("claude-sonnet-4.6".to_string())
         } else {
             None
         }
@@ -113,6 +121,8 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
+        } else if model_lower.contains("opus-4") || model_lower.contains("4-opus") {
             Some("claude-opus-4.8".to_string())
         } else {
             None
@@ -932,6 +942,10 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
+        assert_eq!(
+            map_model("claude-sonnet-4-20250514"),
+            Some("claude-sonnet-4.6".to_string())
+        );
         assert!(
             map_model("claude-sonnet-4-20250514")
                 .unwrap()
@@ -946,6 +960,10 @@ mod tests {
 
     #[test]
     fn test_map_model_opus() {
+        assert_eq!(
+            map_model("claude-opus-4-20250514"),
+            Some("claude-opus-4.8".to_string())
+        );
         assert!(
             map_model("claude-opus-4-20250514")
                 .unwrap()

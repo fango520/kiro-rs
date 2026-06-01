@@ -268,6 +268,7 @@ pub(crate) struct CacheUsageBreakdown {
     pub cache_read_input_tokens: i32,
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
+    pub cache_creation_ttl_known: bool,
     pub prefix_hit_input_jitter: i32,
 }
 
@@ -490,10 +491,12 @@ impl SseStateManager {
                 usage["cache_creation_input_tokens"] =
                     json!(cache_usage.cache_creation_input_tokens);
                 usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
-                usage["cache_creation"] = json!({
-                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
-                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
-                });
+                if cache_usage.cache_creation_ttl_known {
+                    usage["cache_creation"] = json!({
+                        "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                        "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                    });
+                }
             }
             events.push(SseEvent::new(
                 "message_delta",
@@ -607,19 +610,10 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let input_tokens = self
-            .cache_usage
-            .filter(|cache_usage| has_cache_accounting(*cache_usage))
-            .map(|_| 0)
-            .unwrap_or(self.input_tokens);
-        let mut usage = json!({
-            "input_tokens": input_tokens,
+        let usage = json!({
+            "input_tokens": self.input_tokens,
             "output_tokens": 1
         });
-        if let Some(cache_usage) = self.cache_usage {
-            usage["cache_creation_input_tokens"] = json!(cache_usage.cache_creation_input_tokens);
-            usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
-        }
         json!({
             "type": "message_start",
             "message": {
@@ -754,8 +748,9 @@ impl StreamContext {
             self.cache_usage = Some(CacheUsageBreakdown {
                 cache_creation_input_tokens: cache_write,
                 cache_read_input_tokens: cache_read,
-                cache_creation_5m_input_tokens: cache_write,
+                cache_creation_5m_input_tokens: 0,
                 cache_creation_1h_input_tokens: 0,
+                cache_creation_ttl_known: false,
                 prefix_hit_input_jitter: 0,
             });
         }
@@ -1245,10 +1240,6 @@ fn billed_input_tokens(input_tokens: i32, cache_usage: CacheUsageBreakdown) -> i
         .max(0)
 }
 
-fn has_cache_accounting(cache_usage: CacheUsageBreakdown) -> bool {
-    cache_usage.cache_creation_input_tokens > 0 || cache_usage.cache_read_input_tokens > 0
-}
-
 fn scale_cache_usage(
     cache_usage: CacheUsageBreakdown,
     estimated_input_tokens: i32,
@@ -1269,6 +1260,7 @@ fn scale_cache_usage(
             cache_read_input_tokens: actual_input_tokens.saturating_sub(input_tokens),
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: cache_usage.cache_creation_ttl_known,
             prefix_hit_input_jitter: cache_usage.prefix_hit_input_jitter,
         };
     }
@@ -1294,6 +1286,7 @@ fn scale_cache_usage(
             estimated_input_tokens,
             actual_input_tokens,
         ),
+        cache_creation_ttl_known: cache_usage.cache_creation_ttl_known,
         prefix_hit_input_jitter: cache_usage.prefix_hit_input_jitter,
     };
 
@@ -1444,6 +1437,12 @@ impl BufferedStreamContext {
                                 serde_json::json!(cache_usage.cache_creation_input_tokens);
                             usage["cache_read_input_tokens"] =
                                 serde_json::json!(cache_usage.cache_read_input_tokens);
+                            if cache_usage.cache_creation_ttl_known {
+                                usage["cache_creation"] = serde_json::json!({
+                                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                                });
+                            }
                         }
                     }
                 }
@@ -1530,6 +1529,7 @@ mod tests {
             cache_read_input_tokens: 80,
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
             prefix_hit_input_jitter: 0,
         };
 
@@ -1545,6 +1545,7 @@ mod tests {
             cache_read_input_tokens: 777,
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
             prefix_hit_input_jitter: 123,
         };
 
@@ -1561,6 +1562,7 @@ mod tests {
             cache_read_input_tokens: 80,
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
             prefix_hit_input_jitter: 0,
         };
         let mut ctx = StreamContext::new_with_cache_usage(
@@ -1573,7 +1575,8 @@ mod tests {
         ctx.context_input_tokens = Some(300);
 
         let message_start = ctx.create_message_start_event();
-        assert_eq!(message_start["message"]["usage"]["input_tokens"], 0);
+        assert_eq!(message_start["message"]["usage"]["input_tokens"], 100);
+        assert!(message_start["message"]["usage"]["cache_read_input_tokens"].is_null());
 
         let final_events = ctx.generate_final_events();
         let message_delta = final_events
@@ -1591,6 +1594,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation_5m_input_tokens: 80,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
             prefix_hit_input_jitter: 0,
         };
         let mut ctx = StreamContext::new_with_cache_usage(
@@ -1603,7 +1607,8 @@ mod tests {
         ctx.context_input_tokens = Some(300);
 
         let message_start = ctx.create_message_start_event();
-        assert_eq!(message_start["message"]["usage"]["input_tokens"], 0);
+        assert_eq!(message_start["message"]["usage"]["input_tokens"], 100);
+        assert!(message_start["message"]["usage"]["cache_creation_input_tokens"].is_null());
 
         let final_events = ctx.generate_final_events();
         let message_delta = final_events
@@ -1622,12 +1627,13 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_message_start_does_not_leave_estimated_input_for_full_cache_hit() {
+    fn test_stream_message_start_defers_local_cache_fields() {
         let cache_usage = CacheUsageBreakdown {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 100,
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
             prefix_hit_input_jitter: 0,
         };
         let mut ctx = StreamContext::new_with_cache_usage(
@@ -1640,7 +1646,8 @@ mod tests {
         ctx.context_input_tokens = Some(300);
 
         let message_start = ctx.create_message_start_event();
-        assert_eq!(message_start["message"]["usage"]["input_tokens"], 0);
+        assert_eq!(message_start["message"]["usage"]["input_tokens"], 100);
+        assert!(message_start["message"]["usage"]["cache_read_input_tokens"].is_null());
 
         let final_events = ctx.generate_final_events();
         let message_delta = final_events
@@ -1660,6 +1667,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation_5m_input_tokens: 900,
             cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
             prefix_hit_input_jitter: 0,
         };
         let mut ctx = StreamContext::new_with_cache_usage(
@@ -1694,6 +1702,7 @@ mod tests {
             50
         );
         assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 800);
+        assert!(message_delta.data["usage"]["cache_creation"].is_null());
     }
 
     #[test]

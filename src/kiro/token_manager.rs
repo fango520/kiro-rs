@@ -1421,7 +1421,11 @@ impl MultiTokenManager {
                         })
                     },
                     provider: e.credentials.provider.clone(),
-                    has_profile_arn: e.credentials.resolved_profile_arn().is_some(),
+                    has_profile_arn: e
+                        .credentials
+                        .profile_arn
+                        .as_deref()
+                        .is_some_and(|arn| !arn.trim().is_empty()),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
                     } else {
