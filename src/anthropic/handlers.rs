@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -23,9 +23,175 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CacheUsageContext {
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+    cache_creation_5m_input_tokens: i32,
+    cache_creation_1h_input_tokens: i32,
+    prefix_hit_input_jitter: i32,
+}
+
+fn build_cache_profile(
+    cache_tracker: &crate::anthropic::cache_tracker::CacheTracker,
+    payload: &MessagesRequest,
+    total_input_tokens: i32,
+) -> crate::anthropic::cache_tracker::CacheProfile {
+    cache_tracker.build_profile(payload, total_input_tokens)
+}
+
+fn compute_cache_usage(
+    cache_tracker: &crate::anthropic::cache_tracker::CacheTracker,
+    credential_id: u64,
+    profile: &crate::anthropic::cache_tracker::CacheProfile,
+) -> CacheUsageContext {
+    let result = cache_tracker.compute(credential_id, profile);
+    CacheUsageContext {
+        cache_creation_input_tokens: result.cache_creation_input_tokens,
+        cache_read_input_tokens: result.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: result.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: result.cache_creation_1h_input_tokens,
+        prefix_hit_input_jitter: result.prefix_hit_input_jitter,
+    }
+}
+
+fn inject_cache_usage_fields(usage: &mut serde_json::Value, cache_context: CacheUsageContext) {
+    usage["cache_creation_input_tokens"] = json!(cache_context.cache_creation_input_tokens);
+    usage["cache_read_input_tokens"] = json!(cache_context.cache_read_input_tokens);
+    usage["cache_creation"] = json!({
+        "ephemeral_5m_input_tokens": cache_context.cache_creation_5m_input_tokens,
+        "ephemeral_1h_input_tokens": cache_context.cache_creation_1h_input_tokens
+    });
+}
+
+fn upstream_cache_context_from_token_usage(
+    token_usage: &crate::kiro::model::events::TokenUsage,
+) -> Option<CacheUsageContext> {
+    token_usage.has_input_breakdown().then(|| {
+        let cache_write = token_usage.cache_write_tokens();
+        CacheUsageContext {
+            cache_creation_input_tokens: cache_write,
+            cache_read_input_tokens: token_usage.cache_read_tokens(),
+            cache_creation_5m_input_tokens: cache_write,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 0,
+        }
+    })
+}
+
+fn billed_input_tokens(
+    input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    input_tokens
+        .saturating_sub(cache_creation_input_tokens)
+        .saturating_sub(cache_read_input_tokens)
+        .max(0)
+}
+
+fn scale_cache_context(
+    cache_context: CacheUsageContext,
+    estimated_input_tokens: i32,
+    actual_input_tokens: i32,
+) -> CacheUsageContext {
+    if estimated_input_tokens <= 0 || actual_input_tokens <= 0 {
+        return cache_context;
+    }
+
+    if cache_context.prefix_hit_input_jitter > 0
+        && cache_context.cache_creation_input_tokens == 0
+        && cache_context.cache_read_input_tokens > 0
+    {
+        let input_tokens =
+            prefix_hit_input_tokens(actual_input_tokens, cache_context.prefix_hit_input_jitter);
+        return CacheUsageContext {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: actual_input_tokens.saturating_sub(input_tokens),
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: cache_context.prefix_hit_input_jitter,
+        };
+    }
+
+    let mut scaled = CacheUsageContext {
+        cache_creation_input_tokens: scale_token_count(
+            cache_context.cache_creation_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        cache_read_input_tokens: scale_token_count(
+            cache_context.cache_read_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        cache_creation_5m_input_tokens: scale_token_count(
+            cache_context.cache_creation_5m_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        cache_creation_1h_input_tokens: scale_token_count(
+            cache_context.cache_creation_1h_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        prefix_hit_input_jitter: cache_context.prefix_hit_input_jitter,
+    };
+
+    let cache_total = scaled
+        .cache_creation_input_tokens
+        .saturating_add(scaled.cache_read_input_tokens);
+    if cache_total > actual_input_tokens {
+        let overflow = cache_total - actual_input_tokens;
+        scaled.cache_creation_input_tokens =
+            scaled.cache_creation_input_tokens.saturating_sub(overflow);
+    }
+
+    if cache_context.cache_creation_1h_input_tokens > 0
+        && cache_context.cache_creation_5m_input_tokens == 0
+    {
+        scaled.cache_creation_1h_input_tokens = scaled.cache_creation_input_tokens;
+        scaled.cache_creation_5m_input_tokens = 0;
+    } else if cache_context.cache_creation_5m_input_tokens > 0
+        && cache_context.cache_creation_1h_input_tokens == 0
+    {
+        scaled.cache_creation_5m_input_tokens = scaled.cache_creation_input_tokens;
+        scaled.cache_creation_1h_input_tokens = 0;
+    }
+
+    scaled
+}
+
+fn prefix_hit_input_tokens(input_tokens: i32, jitter: i32) -> i32 {
+    if input_tokens <= 0 {
+        return 0;
+    }
+
+    input_tokens
+        .saturating_div(10)
+        .saturating_add(jitter)
+        .clamp(0, input_tokens)
+}
+
+fn scale_token_count(value: i32, estimated_input_tokens: i32, actual_input_tokens: i32) -> i32 {
+    if value <= 0 {
+        return 0;
+    }
+
+    let value = value as i64;
+    let estimated = estimated_input_tokens.max(1) as i64;
+    let actual = actual_input_tokens.max(0) as i64;
+    ((value * actual + estimated / 2) / estimated)
+        .min(actual)
+        .max(0) as i32
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -74,6 +240,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1780012800, // May 29, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1780012800, // May 29, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -223,17 +407,35 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    let prompt_cache = state.prompt_cache_snapshot();
+
+    // 估算输入 tokens，cache 记账需要在 payload 被移动前完成。
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+
+    let cache_profile = prompt_cache
+        .accounting_enabled
+        .then(|| build_cache_profile(prompt_cache.tracker.as_ref(), &payload, input_tokens));
+    let provisional_cache_context = cache_profile
+        .as_ref()
+        .map(|profile| compute_cache_usage(prompt_cache.tracker.as_ref(), 0, profile))
+        .unwrap_or_default();
+    tracing::info!(
+        provisional_cache_creation_input_tokens =
+            provisional_cache_context.cache_creation_input_tokens,
+        provisional_cache_read_input_tokens = provisional_cache_context.cache_read_input_tokens,
+        cache_accounting_enabled = prompt_cache.accounting_enabled,
+        prompt_cache_ttl_seconds = prompt_cache.ttl_seconds,
+        "Computed provisional cache usage for /v1/messages"
+    );
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
@@ -282,14 +484,6 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
-    ) as i32;
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -306,6 +500,10 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_profile.as_ref(),
+            prompt_cache
+                .accounting_enabled
+                .then_some(&prompt_cache.tracker),
             thinking_enabled,
             tool_name_map,
         )
@@ -313,7 +511,19 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            cache_profile.as_ref(),
+            prompt_cache
+                .accounting_enabled
+                .then_some(&prompt_cache.tracker),
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -323,23 +533,53 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_profile: Option<&crate::anthropic::cache_tracker::CacheProfile>,
+    cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
+    let final_cache_context = match (cache_tracker, cache_profile) {
+        (Some(tracker), Some(profile)) => {
+            let resolved = compute_cache_usage(tracker.as_ref(), api_result.credential_id, profile);
+            tracing::info!(
+                credential_id = api_result.credential_id,
+                final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
+                final_cache_read_input_tokens = resolved.cache_read_input_tokens,
+                "Resolved cache usage for stream request"
+            );
+            tracker.update(api_result.credential_id, profile);
+            Some(resolved)
+        }
+        _ => None,
+    };
+    let final_cache_usage = final_cache_context.map(|ctx| CacheUsageBreakdown {
+        cache_creation_input_tokens: ctx.cache_creation_input_tokens,
+        cache_read_input_tokens: ctx.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+        prefix_hit_input_jitter: ctx.prefix_hit_input_jitter,
+    });
+
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_cache_usage(
+        model,
+        input_tokens,
+        final_cache_usage,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(api_result.response, ctx, initial_events);
 
     // 返回 SSE 响应
     Response::builder()
@@ -459,17 +699,34 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_profile: Option<&crate::anthropic::cache_tracker::CacheProfile>,
+    cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let api_result = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
+    let final_cache_context = match (cache_tracker, cache_profile) {
+        (Some(tracker), Some(profile)) => {
+            let resolved = compute_cache_usage(tracker.as_ref(), api_result.credential_id, profile);
+            tracing::info!(
+                credential_id = api_result.credential_id,
+                final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
+                final_cache_read_input_tokens = resolved.cache_read_input_tokens,
+                "Resolved cache usage for non-stream request"
+            );
+            tracker.update(api_result.credential_id, profile);
+            Some(resolved)
+        }
+        _ => None,
+    };
+
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes = match api_result.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
@@ -496,6 +753,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut upstream_token_usage: Option<crate::kiro::model::events::TokenUsage> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -523,14 +781,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -547,12 +805,26 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
+                            if upstream_token_usage
+                                .as_ref()
+                                .and_then(|usage| usage.input_tokens())
+                                .is_some()
+                            {
+                                if context_usage.context_usage_percentage >= 100.0 {
+                                    stop_reason = "model_context_window_exceeded".to_string();
+                                }
+                                tracing::debug!(
+                                    "收到 contextUsageEvent: {}%, 已使用 tokenUsage 真实输入统计，跳过反推",
+                                    context_usage.context_usage_percentage
+                                );
+                                continue;
+                            }
+
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -563,6 +835,20 @@ async fn handle_non_stream_request(
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
+                        }
+                        Event::MessageMetadata(metadata) => {
+                            if let Some(token_usage) = metadata.token_usage {
+                                tracing::info!(
+                                    upstream_input_tokens = token_usage.input_tokens(),
+                                    upstream_output_tokens = token_usage.output_tokens,
+                                    upstream_cache_write_input_tokens =
+                                        token_usage.cache_write_tokens(),
+                                    upstream_cache_read_input_tokens =
+                                        token_usage.cache_read_tokens(),
+                                    "Received upstream Kiro tokenUsage for non-stream request"
+                                );
+                                upstream_token_usage = Some(token_usage);
+                            }
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -614,33 +900,73 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
+    let upstream_input_tokens = upstream_token_usage
+        .as_ref()
+        .and_then(|usage| usage.input_tokens());
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    if let Some(percentage) = upstream_token_usage
+        .as_ref()
+        .and_then(|usage| usage.context_usage_percentage)
+        && percentage >= 100.0
+    {
+        stop_reason = "model_context_window_exceeded".to_string();
+    }
+
+    // 优先使用 Kiro tokenUsage 返回的真实输出 tokens，否则估算。
+    let output_tokens = upstream_token_usage
+        .as_ref()
+        .and_then(|usage| usage.output_tokens)
+        .unwrap_or_else(|| token::estimate_output_tokens(&content));
+
+    // 优先使用 Kiro tokenUsage，其次 contextUsageEvent，最后使用本地估算。
+    let final_input_tokens = upstream_input_tokens
+        .or(context_input_tokens)
+        .unwrap_or(input_tokens);
+    let final_cache_context = upstream_token_usage
+        .as_ref()
+        .and_then(upstream_cache_context_from_token_usage)
+        .or_else(|| {
+            final_cache_context
+                .map(|ctx| scale_cache_context(ctx, input_tokens, final_input_tokens))
+        });
+    let billed_input_tokens = final_cache_context
+        .map(|ctx| {
+            billed_input_tokens(
+                final_input_tokens,
+                ctx.cache_creation_input_tokens,
+                ctx.cache_read_input_tokens,
+            )
+        })
+        .unwrap_or(final_input_tokens);
 
     // 构建 Anthropic 响应
-    let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": model,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
+    let response_body = {
+        let mut usage = json!({
+            "input_tokens": billed_input_tokens,
             "output_tokens": output_tokens
+        });
+        if let Some(cache_context) = final_cache_context {
+            inject_cache_usage_fields(&mut usage, cache_context);
         }
-    });
+
+        json!({
+            "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": model,
+            "stop_reason": stop_reason,
+            "stop_sequence": null,
+            "usage": usage
+        })
+    };
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6/4.8：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -649,10 +975,13 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_adaptive_thinking = model_lower.contains("opus")
+        && (model_lower.contains("4-6")
+            || model_lower.contains("4.6")
+            || model_lower.contains("4-8")
+            || model_lower.contains("4.8"));
 
-    let thinking_type = if is_opus_4_6 {
+    let thinking_type = if is_opus_adaptive_thinking {
         "adaptive"
     } else {
         "enabled"
@@ -668,8 +997,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
+
+    if is_opus_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -736,17 +1065,35 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    let prompt_cache = state.prompt_cache_snapshot();
+
+    // 估算输入 tokens，cache 记账需要在 payload 被移动前完成。
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+
+    let cache_profile = prompt_cache
+        .accounting_enabled
+        .then(|| build_cache_profile(prompt_cache.tracker.as_ref(), &payload, input_tokens));
+    let provisional_cache_context = cache_profile
+        .as_ref()
+        .map(|profile| compute_cache_usage(prompt_cache.tracker.as_ref(), 0, profile))
+        .unwrap_or_default();
+    tracing::info!(
+        provisional_cache_creation_input_tokens =
+            provisional_cache_context.cache_creation_input_tokens,
+        provisional_cache_read_input_tokens = provisional_cache_context.cache_read_input_tokens,
+        cache_accounting_enabled = prompt_cache.accounting_enabled,
+        prompt_cache_ttl_seconds = prompt_cache.ttl_seconds,
+        "Computed provisional cache usage for /cc/v1/messages"
+    );
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
@@ -795,14 +1142,6 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
-    ) as i32;
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -819,6 +1158,10 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_profile.as_ref(),
+            prompt_cache
+                .accounting_enabled
+                .then_some(&prompt_cache.tracker),
             thinking_enabled,
             tool_name_map,
         )
@@ -826,7 +1169,19 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            cache_profile.as_ref(),
+            prompt_cache
+                .accounting_enabled
+                .then_some(&prompt_cache.tracker),
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -839,20 +1194,50 @@ async fn handle_stream_request_buffered(
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,
+    cache_profile: Option<&crate::anthropic::cache_tracker::CacheProfile>,
+    cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
+    let final_cache_context = match (cache_tracker, cache_profile) {
+        (Some(tracker), Some(profile)) => {
+            let resolved = compute_cache_usage(tracker.as_ref(), api_result.credential_id, profile);
+            tracing::info!(
+                credential_id = api_result.credential_id,
+                final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
+                final_cache_read_input_tokens = resolved.cache_read_input_tokens,
+                "Resolved cache usage for buffered stream request"
+            );
+            tracker.update(api_result.credential_id, profile);
+            Some(resolved)
+        }
+        _ => None,
+    };
+    let final_cache_usage = final_cache_context.map(|ctx| CacheUsageBreakdown {
+        cache_creation_input_tokens: ctx.cache_creation_input_tokens,
+        cache_read_input_tokens: ctx.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+        prefix_hit_input_jitter: ctx.prefix_hit_input_jitter,
+    });
+
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        final_cache_usage,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(api_result.response, ctx);
 
     // 返回 SSE 响应
     Response::builder()

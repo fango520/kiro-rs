@@ -229,17 +229,50 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;
 
     for block in content {
-        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-            total += count_tokens(text) as i32;
-        }
-        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-            // 工具调用开销
-            if let Some(input) = block.get("input") {
-                let input_str = serde_json::to_string(input).unwrap_or_default();
-                total += count_tokens(&input_str) as i32;
-            }
-        }
+        total += count_message_content_tokens(block) as i32;
     }
 
     total.max(1)
+}
+
+/// 计算系统消息的 tokens
+pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
+    count_tokens(&message.text)
+}
+
+/// 计算工具定义的 tokens
+pub(crate) fn count_tool_definition_tokens(tool: &Tool) -> u64 {
+    let mut total = 0;
+    total += count_tokens(&tool.name);
+    total += count_tokens(&tool.description);
+    let input_schema_json = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+    total += count_tokens(&input_schema_json);
+    total
+}
+
+/// 计算消息内容的 tokens
+pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::String(text) => count_tokens(text),
+        serde_json::Value::Array(items) => items.iter().map(count_message_content_tokens).sum(),
+        serde_json::Value::Object(map) => {
+            let mut total = 0;
+            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
+                total += count_tokens(text);
+            }
+            if let Some(thinking) = map.get("thinking").and_then(|v| v.as_str()) {
+                total += count_tokens(thinking);
+            }
+            if let Some(content) = map.get("content") {
+                total += count_message_content_tokens(content);
+            }
+            if let Some(input) = map.get("input") {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                total += count_tokens(&input_str);
+            }
+            total
+        }
+        _ => 0,
+    }
 }

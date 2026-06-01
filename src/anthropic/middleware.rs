@@ -1,6 +1,7 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -13,7 +14,15 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
+
+#[derive(Clone)]
+pub(crate) struct PromptCacheSnapshot {
+    pub accounting_enabled: bool,
+    pub ttl_seconds: u64,
+    pub tracker: Arc<CacheTracker>,
+}
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -25,15 +34,29 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 本地 Prompt Cache usage 记账快照
+    pub prompt_cache: PromptCacheSnapshot,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_cache_ttl_seconds: u64,
+        prompt_cache_accounting_enabled: bool,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            prompt_cache: PromptCacheSnapshot {
+                accounting_enabled: prompt_cache_accounting_enabled,
+                ttl_seconds: prompt_cache_ttl_seconds,
+                tracker: Arc::new(CacheTracker::new(Duration::from_secs(
+                    prompt_cache_ttl_seconds,
+                ))),
+            },
         }
     }
 
@@ -41,6 +64,10 @@ impl AppState {
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
         self
+    }
+
+    pub fn prompt_cache_snapshot(&self) -> PromptCacheSnapshot {
+        self.prompt_cache.clone()
     }
 }
 

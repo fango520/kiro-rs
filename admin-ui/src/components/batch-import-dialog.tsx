@@ -29,6 +29,7 @@ interface CredentialInput {
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
+  provider?: string
   endpoint?: string
 }
 
@@ -276,6 +277,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            provider: cred.provider?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,

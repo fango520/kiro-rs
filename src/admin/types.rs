@@ -36,6 +36,8 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 登录 Provider（Google / Github / BuilderId / Enterprise 等）
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -92,6 +94,9 @@ pub struct AddCredentialRequest {
     /// 认证方式（可选，默认 social）
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
+
+    /// 登录 Provider（可选；KAM 新格式会携带 Google/Github/BuilderId 等）
+    pub provider: Option<String>,
 
     /// OIDC Client ID（IdC 认证需要）
     pub client_id: Option<String>,

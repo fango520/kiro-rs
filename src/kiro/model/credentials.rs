@@ -10,6 +10,16 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
+/// Builder ID / IdC 账号的默认 profile ARN。
+///
+/// Kiro 官方客户端在账号文件缺少 profileArn 时仍会补充该默认值。
+pub const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
+/// Google / GitHub Social 登录账号的默认 profile ARN。
+pub const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +47,12 @@ pub struct KiroCredentials {
     /// 认证方式 (social / idc)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+
+    /// 登录 Provider（Google / Github / BuilderId / Enterprise 等）
+    ///
+    /// 旧配置可能没有该字段，运行时会根据 authMethod/clientId 做兼容推断。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,6 +262,62 @@ impl KiroCredentials {
         }
     }
 
+    /// 判断凭据是否按 IdC / Builder ID 认证处理。
+    pub fn is_idc_auth(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("idc")
+                    || m.eq_ignore_ascii_case("builder-id")
+                    || m.eq_ignore_ascii_case("iam")
+            })
+            .unwrap_or_else(|| self.client_id.is_some() && self.client_secret.is_some())
+    }
+
+    /// 判断凭据是否按 Social 认证处理。
+    pub fn is_social_auth(&self) -> bool {
+        if self.is_api_key_credential() {
+            return false;
+        }
+
+        let provider_is_social = self
+            .provider
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("github") || p.eq_ignore_ascii_case("google"));
+
+        let auth_is_social = self
+            .auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("social"))
+            .unwrap_or(false);
+
+        provider_is_social || auth_is_social || !self.is_idc_auth()
+    }
+
+    /// 获取请求 Kiro API 时应使用的 profileArn。
+    ///
+    /// 最新 Kiro 客户端会在缺失 profileArn 时按登录方式补默认值：
+    /// - Google/GitHub/Social → social profile
+    /// - BuilderId/IdC/IAM/Enterprise → builder profile
+    pub fn resolved_profile_arn(&self) -> Option<String> {
+        if let Some(profile_arn) = self.profile_arn.as_deref() {
+            let trimmed = profile_arn.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        if self.is_api_key_credential() {
+            return None;
+        }
+
+        if self.is_social_auth() {
+            Some(KIRO_SOCIAL_PROFILE_ARN.to_string())
+        } else {
+            Some(KIRO_BUILDER_ID_PROFILE_ARN.to_string())
+        }
+    }
+
     /// 检查凭据是否支持 Opus 模型
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
@@ -328,6 +400,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -351,6 +424,49 @@ mod tests {
         assert!(!json.contains("refreshToken"));
         // priority 为 0 时不序列化
         assert!(!json.contains("priority"));
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_social_default() {
+        let creds = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some(KIRO_SOCIAL_PROFILE_ARN)
+        );
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_idc_default() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert!(creds.is_idc_auth());
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_preserves_explicit_value() {
+        let creds = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            profile_arn: Some("arn:explicit".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some("arn:explicit")
+        );
     }
 
     #[test]
@@ -446,6 +562,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -477,6 +594,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -591,6 +709,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 3,

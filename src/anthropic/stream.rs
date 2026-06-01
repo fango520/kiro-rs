@@ -189,27 +189,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -266,6 +260,15 @@ impl BlockState {
             stopped: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheUsageBreakdown {
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+    pub prefix_hit_input_jitter: i32,
 }
 
 /// SSE 状态管理器
@@ -458,6 +461,7 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -478,6 +482,19 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            let mut usage = json!({
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens
+            });
+            if let Some(cache_usage) = cache_usage {
+                usage["cache_creation_input_tokens"] =
+                    json!(cache_usage.cache_creation_input_tokens);
+                usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+                usage["cache_creation"] = json!({
+                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                });
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -486,10 +503,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": usage
                 }),
             ));
         }
@@ -519,8 +533,14 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
+    /// Prompt Cache usage 统计
+    pub cache_usage: Option<CacheUsageBreakdown>,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// Kiro tokenUsage 返回的真实输出 tokens
+    pub upstream_output_tokens: Option<i32>,
+    /// 是否已收到 Kiro tokenUsage 真实输入统计
+    has_upstream_token_usage: bool,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -546,9 +566,20 @@ pub struct StreamContext {
 
 impl StreamContext {
     /// 创建启用thinking的StreamContext
+    #[allow(dead_code)]
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        Self::new_with_cache_usage(model, input_tokens, None, thinking_enabled, tool_name_map)
+    }
+
+    pub fn new_with_cache_usage(
+        model: impl Into<String>,
+        input_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
@@ -557,7 +588,10 @@ impl StreamContext {
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
+            cache_usage,
             context_input_tokens: None,
+            upstream_output_tokens: None,
+            has_upstream_token_usage: false,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -573,6 +607,19 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let input_tokens = self
+            .cache_usage
+            .filter(|cache_usage| has_cache_accounting(*cache_usage))
+            .map(|_| 0)
+            .unwrap_or(self.input_tokens);
+        let mut usage = json!({
+            "input_tokens": input_tokens,
+            "output_tokens": 1
+        });
+        if let Some(cache_usage) = self.cache_usage {
+            usage["cache_creation_input_tokens"] = json!(cache_usage.cache_creation_input_tokens);
+            usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+        }
         json!({
             "type": "message_start",
             "message": {
@@ -583,10 +630,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
@@ -636,11 +680,22 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
+                if self.has_upstream_token_usage {
+                    if context_usage.context_usage_percentage >= 100.0 {
+                        self.state_manager
+                            .set_stop_reason("model_context_window_exceeded");
+                    }
+                    tracing::debug!(
+                        "收到 contextUsageEvent: {}%, 已使用 tokenUsage 真实输入统计，跳过反推",
+                        context_usage.context_usage_percentage
+                    );
+                    return Vec::new();
+                }
+
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -652,6 +707,12 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::MessageMetadata(metadata) => {
+                if let Some(token_usage) = metadata.token_usage.as_ref() {
+                    self.apply_token_usage(token_usage);
+                }
                 Vec::new()
             }
             Event::Error {
@@ -674,6 +735,45 @@ impl StreamContext {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn apply_token_usage(&mut self, token_usage: &crate::kiro::model::events::TokenUsage) {
+        if let Some(input_tokens) = token_usage.input_tokens() {
+            self.input_tokens = input_tokens;
+            self.context_input_tokens = Some(input_tokens);
+            self.has_upstream_token_usage = true;
+        }
+
+        if let Some(output_tokens) = token_usage.output_tokens {
+            self.upstream_output_tokens = Some(output_tokens);
+        }
+
+        if token_usage.has_input_breakdown() {
+            let cache_write = token_usage.cache_write_tokens();
+            let cache_read = token_usage.cache_read_tokens();
+            self.cache_usage = Some(CacheUsageBreakdown {
+                cache_creation_input_tokens: cache_write,
+                cache_read_input_tokens: cache_read,
+                cache_creation_5m_input_tokens: cache_write,
+                cache_creation_1h_input_tokens: 0,
+                prefix_hit_input_jitter: 0,
+            });
+        }
+
+        if let Some(percentage) = token_usage.context_usage_percentage {
+            if percentage >= 100.0 {
+                self.state_manager
+                    .set_stop_reason("model_context_window_exceeded");
+            }
+        }
+
+        tracing::info!(
+            upstream_input_tokens = token_usage.input_tokens(),
+            upstream_output_tokens = token_usage.output_tokens,
+            upstream_cache_write_input_tokens = token_usage.cache_write_tokens(),
+            upstream_cache_read_input_tokens = token_usage.cache_read_tokens(),
+            "Received upstream Kiro tokenUsage"
+        );
     }
 
     /// 处理助手响应事件
@@ -1119,14 +1219,130 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let cache_usage = self.cache_usage.map(|cache_usage| {
+            scale_cache_usage(cache_usage, self.input_tokens, final_input_tokens)
+        });
+        let reported_input_tokens = cache_usage
+            .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
+            .unwrap_or(final_input_tokens);
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        let final_output_tokens = self.upstream_output_tokens.unwrap_or(self.output_tokens);
+
+        events.extend(self.state_manager.generate_final_events(
+            reported_input_tokens,
+            final_output_tokens,
+            cache_usage,
+        ));
         events
     }
+}
+
+fn billed_input_tokens(input_tokens: i32, cache_usage: CacheUsageBreakdown) -> i32 {
+    input_tokens
+        .saturating_sub(cache_usage.cache_creation_input_tokens)
+        .saturating_sub(cache_usage.cache_read_input_tokens)
+        .max(0)
+}
+
+fn has_cache_accounting(cache_usage: CacheUsageBreakdown) -> bool {
+    cache_usage.cache_creation_input_tokens > 0 || cache_usage.cache_read_input_tokens > 0
+}
+
+fn scale_cache_usage(
+    cache_usage: CacheUsageBreakdown,
+    estimated_input_tokens: i32,
+    actual_input_tokens: i32,
+) -> CacheUsageBreakdown {
+    if estimated_input_tokens <= 0 || actual_input_tokens <= 0 {
+        return cache_usage;
+    }
+
+    if cache_usage.prefix_hit_input_jitter > 0
+        && cache_usage.cache_creation_input_tokens == 0
+        && cache_usage.cache_read_input_tokens > 0
+    {
+        let input_tokens =
+            prefix_hit_input_tokens(actual_input_tokens, cache_usage.prefix_hit_input_jitter);
+        return CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: actual_input_tokens.saturating_sub(input_tokens),
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: cache_usage.prefix_hit_input_jitter,
+        };
+    }
+
+    let mut scaled = CacheUsageBreakdown {
+        cache_creation_input_tokens: scale_token_count(
+            cache_usage.cache_creation_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        cache_read_input_tokens: scale_token_count(
+            cache_usage.cache_read_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        cache_creation_5m_input_tokens: scale_token_count(
+            cache_usage.cache_creation_5m_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        cache_creation_1h_input_tokens: scale_token_count(
+            cache_usage.cache_creation_1h_input_tokens,
+            estimated_input_tokens,
+            actual_input_tokens,
+        ),
+        prefix_hit_input_jitter: cache_usage.prefix_hit_input_jitter,
+    };
+
+    let cache_total = scaled
+        .cache_creation_input_tokens
+        .saturating_add(scaled.cache_read_input_tokens);
+    if cache_total > actual_input_tokens {
+        let overflow = cache_total - actual_input_tokens;
+        scaled.cache_creation_input_tokens =
+            scaled.cache_creation_input_tokens.saturating_sub(overflow);
+    }
+
+    if cache_usage.cache_creation_1h_input_tokens > 0
+        && cache_usage.cache_creation_5m_input_tokens == 0
+    {
+        scaled.cache_creation_1h_input_tokens = scaled.cache_creation_input_tokens;
+        scaled.cache_creation_5m_input_tokens = 0;
+    } else if cache_usage.cache_creation_5m_input_tokens > 0
+        && cache_usage.cache_creation_1h_input_tokens == 0
+    {
+        scaled.cache_creation_5m_input_tokens = scaled.cache_creation_input_tokens;
+        scaled.cache_creation_1h_input_tokens = 0;
+    }
+
+    scaled
+}
+
+fn prefix_hit_input_tokens(input_tokens: i32, jitter: i32) -> i32 {
+    if input_tokens <= 0 {
+        return 0;
+    }
+
+    input_tokens
+        .saturating_div(10)
+        .saturating_add(jitter)
+        .clamp(0, input_tokens)
+}
+
+fn scale_token_count(value: i32, estimated_input_tokens: i32, actual_input_tokens: i32) -> i32 {
+    if value <= 0 {
+        return 0;
+    }
+
+    let value = value as i64;
+    let estimated = estimated_input_tokens.max(1) as i64;
+    let actual = actual_input_tokens.max(0) as i64;
+    ((value * actual + estimated / 2) / estimated)
+        .min(actual)
+        .max(0) as i32
 }
 
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
@@ -1144,8 +1360,6 @@ pub struct BufferedStreamContext {
     inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
 }
@@ -1155,15 +1369,20 @@ impl BufferedStreamContext {
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_cache_usage(
+            model,
+            estimated_input_tokens,
+            cache_usage,
+            thinking_enabled,
+            tool_name_map,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
-            estimated_input_tokens,
             initial_events_generated: false,
         }
     }
@@ -1206,14 +1425,26 @@ impl BufferedStreamContext {
         let final_input_tokens = self
             .inner
             .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+            .unwrap_or(self.inner.input_tokens);
+        let cache_usage = self.inner.cache_usage.map(|cache_usage| {
+            scale_cache_usage(cache_usage, self.inner.input_tokens, final_input_tokens)
+        });
+        let reported_input_tokens = cache_usage
+            .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
+            .unwrap_or(final_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(reported_input_tokens);
+                        if let Some(cache_usage) = cache_usage {
+                            usage["cache_creation_input_tokens"] =
+                                serde_json::json!(cache_usage.cache_creation_input_tokens);
+                            usage["cache_read_input_tokens"] =
+                                serde_json::json!(cache_usage.cache_read_input_tokens);
+                        }
                     }
                 }
             }
@@ -1293,11 +1524,187 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_usage_scales_to_actual_context_tokens() {
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 80,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 0,
+        };
+
+        let scaled = scale_cache_usage(cache_usage, 100, 300);
+        assert_eq!(scaled.cache_creation_input_tokens, 0);
+        assert_eq!(scaled.cache_read_input_tokens, 240);
+    }
+
+    #[test]
+    fn test_prefix_hit_cache_usage_scales_with_original_jitter() {
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 777,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 123,
+        };
+
+        let scaled = scale_cache_usage(cache_usage, 1000, 3000);
+        assert_eq!(scaled.cache_creation_input_tokens, 0);
+        assert_eq!(scaled.cache_read_input_tokens, 2577);
+        assert_eq!(billed_input_tokens(3000, scaled), 423);
+    }
+
+    #[test]
+    fn test_cache_read_usage_reduces_reported_input_tokens() {
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 80,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = StreamContext::new_with_cache_usage(
+            "test-model",
+            100,
+            Some(cache_usage),
+            false,
+            HashMap::new(),
+        );
+        ctx.context_input_tokens = Some(300);
+
+        let message_start = ctx.create_message_start_event();
+        assert_eq!(message_start["message"]["usage"]["input_tokens"], 0);
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("should emit message_delta");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 60);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 240);
+    }
+
+    #[test]
+    fn test_cache_creation_usage_reduces_reported_input_tokens() {
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 80,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 80,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = StreamContext::new_with_cache_usage(
+            "test-model",
+            100,
+            Some(cache_usage),
+            false,
+            HashMap::new(),
+        );
+        ctx.context_input_tokens = Some(300);
+
+        let message_start = ctx.create_message_start_event();
+        assert_eq!(message_start["message"]["usage"]["input_tokens"], 0);
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("should emit message_delta");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 60);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            240
+        );
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+            240
+        );
+    }
+
+    #[test]
+    fn test_stream_message_start_does_not_leave_estimated_input_for_full_cache_hit() {
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 100,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = StreamContext::new_with_cache_usage(
+            "test-model",
+            100,
+            Some(cache_usage),
+            false,
+            HashMap::new(),
+        );
+        ctx.context_input_tokens = Some(300);
+
+        let message_start = ctx.create_message_start_event();
+        assert_eq!(message_start["message"]["usage"]["input_tokens"], 0);
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("should emit message_delta");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 0);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 300);
+    }
+
+    #[test]
+    fn test_upstream_token_usage_overrides_local_cache_usage() {
+        use crate::kiro::model::events::{MessageMetadataEvent, TokenUsage};
+
+        let local_cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 900,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 900,
+            cache_creation_1h_input_tokens: 0,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = StreamContext::new_with_cache_usage(
+            "test-model",
+            1000,
+            Some(local_cache_usage),
+            false,
+            HashMap::new(),
+        );
+
+        ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+            token_usage: Some(TokenUsage {
+                uncached_input_tokens: Some(100),
+                cache_read_input_tokens: Some(800),
+                cache_write_input_tokens: Some(50),
+                output_tokens: Some(12),
+                total_tokens: Some(962),
+                context_usage_percentage: Some(3.0),
+            }),
+        }));
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("should emit message_delta");
+
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 100);
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 12);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            50
+        );
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
     fn test_tool_name_reverse_mapping_in_stream() {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
@@ -1313,10 +1720,12 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
     }
@@ -1738,7 +2147,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1751,14 +2165,11 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1790,9 +2201,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1811,7 +2220,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1829,7 +2242,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1849,7 +2266,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1878,7 +2299,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -1968,12 +2393,14 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events

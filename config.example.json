@@ -1,6 +1,7 @@
 {
   "host": "127.0.0.1",
   "port": 8990,
+  "kiroVersion": "0.12.155",
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "tlsBackend": "rustls",
   "region": "us-east-1",

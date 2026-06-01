@@ -98,6 +98,14 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// Prompt Cache TTL（秒），默认 300 秒
+    #[serde(default = "default_prompt_cache_ttl_seconds")]
+    pub prompt_cache_ttl_seconds: u64,
+
+    /// 是否启用本地 Prompt Cache usage 记账，默认 true
+    #[serde(default = "default_true")]
+    pub prompt_cache_accounting_enabled: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -127,7 +135,7 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    "0.12.155".to_string()
 }
 
 fn default_system_version() -> String {
@@ -152,6 +160,14 @@ fn default_load_balancing_mode() -> String {
 }
 
 fn default_extract_thinking() -> bool {
+    true
+}
+
+fn default_prompt_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -182,6 +198,8 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
+            prompt_cache_accounting_enabled: default_true(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
@@ -236,7 +254,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

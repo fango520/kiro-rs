@@ -30,14 +30,46 @@ impl IdeEndpoint {
         format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
+    fn cli_os(&self, ctx: &RequestContext<'_>) -> &'static str {
+        let os = ctx
+            .config
+            .system_version
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if os.contains("win") {
+            "windows"
+        } else if os.contains("darwin") || os.contains("mac") {
+            "macos"
+        } else {
+            "linux"
+        }
+    }
+
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        if ctx.credentials.is_idc_auth() {
+            return format!(
+                "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/{} lang/rust/1.87.0 m/E app/AmazonQ-For-CLI",
+                self.cli_os(ctx)
+            );
+        }
+
         format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+            "aws-sdk-js/1.0.34 KiroIDE {} {}",
             ctx.config.kiro_version, ctx.machine_id
         )
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        if ctx.credentials.is_idc_auth() {
+            return format!(
+                "aws-sdk-rust/1.3.9 os/{} lang/rust/1.87.0",
+                self.cli_os(ctx)
+            );
+        }
+
         format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
@@ -71,9 +103,15 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        let agent_mode = if ctx.credentials.is_idc_auth() {
+            "vibe"
+        } else {
+            "spec"
+        };
+
         let mut req = req
             .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header("x-amzn-kiro-agent-mode", agent_mode)
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
@@ -106,7 +144,7 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.profile_arn)
+        inject_profile_arn(body, &ctx.credentials.resolved_profile_arn())
     }
 }
 

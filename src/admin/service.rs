@@ -75,6 +75,7 @@ impl AdminService {
                 is_current: entry.id == snapshot.current_id,
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
+                provider: entry.provider,
                 has_profile_arn: entry.has_profile_arn,
                 refresh_token_hash: entry.refresh_token_hash,
                 api_key_hash: entry.api_key_hash,
@@ -220,6 +221,7 @@ impl AdminService {
             profile_arn: None,
             expires_at: None,
             auth_method: Some(req.auth_method),
+            provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
@@ -448,7 +450,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

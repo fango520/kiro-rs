@@ -23,12 +23,15 @@ interface KamAccount {
   email?: string
   userId?: string | null
   nickname?: string
+  provider?: string
+  idp?: string
   credentials: {
     refreshToken: string
     clientId?: string
     clientSecret?: string
     region?: string
     authMethod?: string
+    provider?: string
     startUrl?: string
   }
   machineId?: string
@@ -69,12 +72,21 @@ function normalizeKamAccount(item: unknown): unknown {
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
+    const provider =
+      typeof obj.provider === 'string'
+        ? obj.provider
+        : typeof obj.idp === 'string'
+          ? obj.idp
+          : typeof obj.loginMethod === 'string'
+            ? obj.loginMethod
+            : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
 
     return {
       email,
       userId,
       nickname,
+      provider,
       status,
       machineId,
       credentials: {
@@ -83,6 +95,7 @@ function normalizeKamAccount(item: unknown): unknown {
         clientSecret,
         region,
         authMethod,
+        provider,
         startUrl,
       },
     }
@@ -277,6 +290,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            provider: cred.provider?.trim() || account.provider?.trim() || account.idp?.trim() || undefined,
             authRegion: cred.region?.trim() || undefined,
             clientId,
             clientSecret,
