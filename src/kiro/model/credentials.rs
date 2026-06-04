@@ -81,7 +81,7 @@ pub struct KiroCredentials {
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID 配置（可选）
-    /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
+    /// 未配置时回退到 config.json 的 machineId；都未配置时运行时生成随机值并写回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 

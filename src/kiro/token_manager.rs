@@ -524,16 +524,26 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// balanced 模式下的会话到凭据绑定，避免同一对话在账号之间来回漂移
+    session_affinity: Mutex<HashMap<String, SessionAffinityEntry>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
 }
 
+#[derive(Clone)]
+struct SessionAffinityEntry {
+    credential_id: u64,
+    last_used_at: Instant,
+}
+
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话亲和有效期，避免长期运行进程积累无限会话 key
+const SESSION_AFFINITY_TTL: StdDuration = StdDuration::from_secs(2 * 60 * 60);
 
 /// API 调用上下文
 ///
@@ -655,6 +665,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            session_affinity: Mutex::new(HashMap::new()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -699,24 +710,10 @@ impl MultiTokenManager {
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| !e.disabled && Self::credential_supports_model(&e.credentials, model))
             .collect();
 
         if available.is_empty() {
@@ -744,6 +741,85 @@ impl MultiTokenManager {
         }
     }
 
+    fn credential_supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        !is_opus || credentials.supports_opus()
+    }
+
+    fn is_balanced_mode(&self) -> bool {
+        self.load_balancing_mode.lock().as_str() == "balanced"
+    }
+
+    fn normalize_session_key(session_key: Option<&str>) -> Option<&str> {
+        session_key
+            .map(str::trim)
+            .and_then(|key| (!key.is_empty()).then_some(key))
+    }
+
+    fn prune_session_affinity_locked(map: &mut HashMap<String, SessionAffinityEntry>) {
+        let now = Instant::now();
+        map.retain(|_, entry| now.duration_since(entry.last_used_at) <= SESSION_AFFINITY_TTL);
+    }
+
+    fn credential_for_session(
+        &self,
+        session_key: &str,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let credential_id = {
+            let mut affinity = self.session_affinity.lock();
+            Self::prune_session_affinity_locked(&mut affinity);
+            affinity.get(session_key).map(|entry| entry.credential_id)
+        }?;
+
+        let hit = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| {
+                    e.id == credential_id
+                        && !e.disabled
+                        && Self::credential_supports_model(&e.credentials, model)
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+        };
+
+        if hit.is_none() {
+            self.clear_session_affinity(session_key);
+        }
+
+        hit
+    }
+
+    fn remember_session_affinity(&self, session_key: &str, credential_id: u64) {
+        let mut affinity = self.session_affinity.lock();
+        Self::prune_session_affinity_locked(&mut affinity);
+        affinity.insert(
+            session_key.to_string(),
+            SessionAffinityEntry {
+                credential_id,
+                last_used_at: Instant::now(),
+            },
+        );
+    }
+
+    fn clear_session_affinity(&self, session_key: &str) {
+        self.session_affinity.lock().remove(session_key);
+    }
+
+    fn clear_session_affinity_for_credential(&self, credential_id: u64) {
+        self.session_affinity
+            .lock()
+            .retain(|_, entry| entry.credential_id != credential_id);
+    }
+
+    fn clear_all_session_affinity(&self) {
+        self.session_affinity.lock().clear();
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -755,6 +831,18 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session(model, None).await
+    }
+
+    /// 获取 API 调用上下文，并在 balanced 模式下按会话绑定凭据。
+    ///
+    /// 同一个 `session_key` 会尽量复用同一凭据，避免同一对话在不同账号之间切换。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        let session_key = Self::normalize_session_key(session_key);
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -771,20 +859,30 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                let session_hit = if is_balanced {
+                    session_key.and_then(|key| self.credential_for_session(key, model))
+                } else {
+                    None
+                };
+
+                // balanced 模式：有会话绑定时优先复用绑定凭据，否则重新均衡选择
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if session_hit.is_some() || is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && Self::credential_supports_model(&e.credentials, model)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
-                if let Some(hit) = current_hit {
+                if let Some(hit) = session_hit.or(current_hit) {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
@@ -830,9 +928,17 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    if self.is_balanced_mode() {
+                        if let Some(session_key) = session_key {
+                            self.remember_session_affinity(session_key, ctx.id);
+                        }
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    if let Some(session_key) = session_key {
+                        self.clear_session_affinity(session_key);
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -935,7 +1041,7 @@ impl MultiTokenManager {
                     }
                 }
 
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
+                // 回写凭据到文件，失败只记录警告
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
@@ -972,20 +1078,18 @@ impl MultiTokenManager {
     /// 将凭据列表回写到源文件
     ///
     /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
     /// - credentials_path 已设置
+    ///
+    /// 写回格式：
+    /// - 源文件是单凭据格式且当前只有 1 个凭据：写回单对象
+    /// - 其他情况：写回数组
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -1008,7 +1112,11 @@ impl MultiTokenManager {
         };
 
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = if !self.is_multiple_format && credentials.len() == 1 {
+            serde_json::to_string_pretty(&credentials[0]).context("序列化凭据失败")?
+        } else {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1199,6 +1307,7 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1249,6 +1358,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1283,35 +1393,36 @@ impl MultiTokenManager {
             );
 
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-
-            tracing::error!(
-                "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
-                id,
-                refresh_failure_count
-            );
-
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
+                entries.iter().any(|e| !e.disabled)
             } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+
+                tracing::error!(
+                    "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
+                    id,
+                    refresh_failure_count
+                );
+
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    true
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    false
+                }
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1360,6 +1471,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1489,6 +1601,9 @@ impl MultiTokenManager {
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
+        }
+        if disabled {
+            self.clear_session_affinity_for_credential(id);
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1658,7 +1773,15 @@ impl MultiTokenManager {
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
-    pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+    pub async fn add_credential(&self, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        new_cred.canonicalize_auth_method();
+        if new_cred.machine_id.is_none() {
+            new_cred.machine_id = Some(machine_id::generate_from_credentials(
+                &new_cred,
+                &self.config,
+            ));
+        }
+
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -1820,6 +1943,7 @@ impl MultiTokenManager {
         if was_current {
             self.select_highest_priority();
         }
+        self.clear_session_affinity_for_credential(id);
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
         {
@@ -1919,6 +2043,7 @@ impl MultiTokenManager {
         }
 
         *self.load_balancing_mode.lock() = mode.clone();
+        self.clear_all_session_affinity();
 
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;
@@ -2308,6 +2433,75 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_single_credentials_format_persists_as_object() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-single-credentials-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let _manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        let persisted = std::fs::read_to_string(&credentials_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert!(json.is_object());
+        assert!(json.get("machineId").and_then(|v| v.as_str()).is_some());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_balanced_mode_uses_session_affinity() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test_1".to_string()),
+            ..Default::default()
+        };
+        cred1.priority = 0;
+        let mut cred2 = KiroCredentials {
+            id: Some(2),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test_2".to_string()),
+            ..Default::default()
+        };
+        cred2.priority = 1;
+
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, true).unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("conversation-a"))
+            .await
+            .unwrap();
+        manager.report_success(first.id);
+
+        let same_session = manager
+            .acquire_context_for_session(None, Some("conversation-a"))
+            .await
+            .unwrap();
+        assert_eq!(same_session.id, first.id);
+
+        let other_session = manager
+            .acquire_context_for_session(None, Some("conversation-b"))
+            .await
+            .unwrap();
+        assert_ne!(other_session.id, first.id);
     }
 
     #[tokio::test]

@@ -102,6 +102,13 @@ impl KiroEndpoint for IdeEndpoint {
         format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
     }
 
+    fn models_url(&self, ctx: &RequestContext<'_>) -> Option<String> {
+        Some(format!(
+            "https://q.{}.amazonaws.com/ListAvailableModels",
+            self.api_region(ctx)
+        ))
+    }
+
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let agent_mode = if ctx.credentials.is_idc_auth() {
             "vibe"
@@ -117,6 +124,20 @@ impl KiroEndpoint for IdeEndpoint {
             .header("host", self.host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
+            .header("Authorization", format!("Bearer {}", ctx.token));
+
+        if ctx.credentials.is_api_key_credential() {
+            req = req.header("tokentype", "API_KEY");
+        }
+        req
+    }
+
+    fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        let mut req = req
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("user-agent", self.user_agent(ctx))
+            .header("host", self.host(ctx))
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if ctx.credentials.is_api_key_credential() {

@@ -6,9 +6,10 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -31,6 +32,45 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 动态模型列表缓存有效期
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Kiro 官方模型信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroAvailableModel {
+    pub model_id: String,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub token_limits: Option<KiroModelTokenLimits>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroModelTokenLimits {
+    pub max_input_tokens: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableModelsResponse {
+    #[serde(default)]
+    models: Vec<KiroAvailableModel>,
+    next_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct ModelCache {
+    models: Vec<KiroAvailableModel>,
+    fetched_at: Instant,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -49,6 +89,8 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// ListAvailableModels 缓存
+    model_cache: Mutex<Option<ModelCache>>,
 }
 
 impl KiroProvider {
@@ -84,6 +126,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            model_cache: Mutex::new(None),
         }
     }
 
@@ -109,6 +152,85 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 获取 Kiro 官方可用模型列表（带 5 分钟缓存）。
+    pub async fn list_available_models(&self) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        {
+            let cache = self.model_cache.lock();
+            if let Some(cache) = cache.as_ref() {
+                if cache.fetched_at.elapsed() <= MODEL_CACHE_TTL {
+                    return Ok(cache.models.clone());
+                }
+            }
+        }
+
+        let models = self.fetch_available_models().await?;
+        *self.model_cache.lock() = Some(ModelCache {
+            models: models.clone(),
+            fetched_at: Instant::now(),
+        });
+        Ok(models)
+    }
+
+    async fn fetch_available_models(&self) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let ctx = self.token_manager.acquire_context(None).await?;
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+        let endpoint = self.endpoint_for(&ctx.credentials)?;
+
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config,
+        };
+
+        let url = endpoint
+            .models_url(&rctx)
+            .ok_or_else(|| anyhow::anyhow!("端点不支持动态模型列表: {}", endpoint.name()))?;
+
+        let mut all_models = Vec::new();
+        let mut next_token: Option<String> = None;
+
+        loop {
+            let mut params = vec![
+                ("origin", "AI_EDITOR".to_string()),
+                ("maxResults", "50".to_string()),
+            ];
+
+            if let Some(profile_arn) = ctx.credentials.resolved_profile_arn() {
+                params.push(("profileArn", profile_arn));
+            }
+            if let Some(token) = next_token.as_ref() {
+                params.push(("nextToken", token.clone()));
+            }
+
+            let base = self
+                .client_for(&ctx.credentials)?
+                .get(&url)
+                .query(&params)
+                .header("Accept", "application/json")
+                .header("Connection", "close");
+            let request = endpoint.decorate_models(base, &rctx);
+            let response = request.send().await?;
+            let status = response.status();
+
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("ListAvailableModels 请求失败: {} {}", status, body);
+            }
+
+            let page: ListAvailableModelsResponse = response.json().await?;
+            all_models.extend(page.models);
+
+            next_token = page.next_token.filter(|token| !token.trim().is_empty());
+            if next_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(all_models)
     }
 
     /// 发送非流式 API 请求
@@ -297,10 +419,15 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let session_key = Self::extract_conversation_id_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session(model.as_deref(), session_key.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -519,6 +646,20 @@ impl KiroProvider {
             .get("userInputMessage")?
             .get("modelId")?
             .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// 从请求体中提取 conversationId，用于 balanced 模式下的会话凭据绑定。
+    fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
 
