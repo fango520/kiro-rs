@@ -240,13 +240,8 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// GET /v1/models
-///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
-    let models = vec![
+fn static_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
@@ -373,7 +368,85 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
+    ]
+}
+
+fn model_display_name(model_id: &str, model_name: Option<&str>) -> String {
+    if let Some(name) = model_name {
+        if !name.trim().is_empty() {
+            return name.trim().to_string();
+        }
+    }
+
+    model_id
+        .replace('-', " ")
+        .replace('.', " ")
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn model_from_kiro(model: crate::kiro::provider::KiroAvailableModel) -> Option<Model> {
+    let id = model.model_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+
+    Some(Model {
+        id: id.to_string(),
+        object: "model".to_string(),
+        created: 0,
+        owned_by: model
+            .model_provider
+            .filter(|provider| !provider.trim().is_empty())
+            .unwrap_or_else(|| "kiro".to_string()),
+        display_name: model_display_name(
+            id,
+            model.model_name.as_deref().or(model.description.as_deref()),
+        ),
+        model_type: "chat".to_string(),
+        max_tokens: model
+            .token_limits
+            .and_then(|limits| limits.max_input_tokens.or(limits.max_output_tokens))
+            .unwrap_or(200_000),
+    })
+}
+
+/// GET /v1/models
+///
+/// 返回可用的模型列表
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
+
+    let models = if let Some(provider) = &state.kiro_provider {
+        match provider.list_available_models().await {
+            Ok(dynamic_models) => {
+                let models: Vec<Model> = dynamic_models
+                    .into_iter()
+                    .filter_map(model_from_kiro)
+                    .collect();
+                if models.is_empty() {
+                    tracing::warn!("动态模型列表为空，回退到静态模型列表");
+                    static_models()
+                } else {
+                    models
+                }
+            }
+            Err(err) => {
+                tracing::warn!("动态模型列表获取失败，回退到静态模型列表: {}", err);
+                static_models()
+            }
+        }
+    } else {
+        static_models()
+    };
 
     Json(ModelsResponse {
         object: "list".to_string(),

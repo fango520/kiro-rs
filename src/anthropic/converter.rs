@@ -94,6 +94,35 @@ Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
 /// 优先匹配明确版本；没有明确 Kiro 版本的旧 Anthropic 别名映射到当前默认版本。
+fn normalize_direct_kiro_claude_model(model: &str) -> Option<String> {
+    let lower = model.trim().to_lowercase();
+    let base = lower.strip_suffix("-thinking").unwrap_or(&lower);
+    let parts: Vec<&str> = base.split('-').collect();
+
+    if parts.len() < 3 || parts[0] != "claude" {
+        return None;
+    }
+
+    let family = parts[1];
+    if !matches!(family, "sonnet" | "opus" | "haiku") {
+        return None;
+    }
+
+    let version = if parts[2].contains('.') {
+        parts[2].to_string()
+    } else if parts.len() >= 4
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+        && (1..=2).contains(&parts[3].len())
+        && parts[3].chars().all(|c| c.is_ascii_digit())
+    {
+        format!("{}.{}", parts[2], parts[3])
+    } else {
+        return None;
+    };
+
+    Some(format!("claude-{}-{}", family, version))
+}
+
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -102,6 +131,8 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if let Some(model_id) = normalize_direct_kiro_claude_model(model) {
+            Some(model_id)
         } else if model_lower.contains("sonnet-4")
             || model_lower.contains("4-sonnet")
             || model_lower.contains("sonnet-3-5")
@@ -122,13 +153,15 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
+        } else if let Some(model_id) = normalize_direct_kiro_claude_model(model) {
+            Some(model_id)
         } else if model_lower.contains("opus-4") || model_lower.contains("4-opus") {
             Some("claude-opus-4.8".to_string())
         } else {
             None
         }
     } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
+        normalize_direct_kiro_claude_model(model).or_else(|| Some("claude-haiku-4.5".to_string()))
     } else {
         None
     }
@@ -1023,6 +1056,22 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_direct_future_kiro_model() {
+        assert_eq!(
+            map_model("claude-sonnet-4-7"),
+            Some("claude-sonnet-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5.0-thinking"),
+            Some("claude-opus-5.0".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-4-6-20260601"),
+            Some("claude-haiku-4.6".to_string())
+        );
     }
 
     #[test]

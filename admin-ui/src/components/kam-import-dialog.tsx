@@ -25,11 +25,15 @@ interface KamAccount {
   nickname?: string
   provider?: string
   idp?: string
+  profileArn?: string
   credentials: {
     refreshToken: string
     clientId?: string
     clientSecret?: string
     region?: string
+    authRegion?: string
+    apiRegion?: string
+    profileArn?: string
     authMethod?: string
     provider?: string
     startUrl?: string
@@ -49,58 +53,117 @@ interface VerificationResult {
   rollbackError?: string
 }
 
-
-
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
+function normalizeUsageApiRegion(region?: string): string | undefined {
+  const trimmed = region?.trim()
+  if (!trimmed) return undefined
+  return trimmed.toLowerCase().startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+}
+
+function decodeBase64Url(segment: string): string {
+  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/')
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), '=')
+  const binary = atob(padded)
+  const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+function extractStartUrlFromClientSecret(clientSecret?: string): string | undefined {
+  const token = clientSecret?.trim()
+  if (!token) return undefined
+
+  const payloadSegment = token.split('.')[1]
+  if (!payloadSegment) return undefined
+
+  try {
+    const payload = JSON.parse(decodeBase64Url(payloadSegment)) as Record<string, unknown>
+    const serialized = typeof payload.serialized === 'string' ? payload.serialized : undefined
+    if (!serialized) return undefined
+
+    const client = JSON.parse(serialized) as Record<string, unknown>
+    const startUrl = client.initiateLoginUri
+    return typeof startUrl === 'string' && startUrl.trim() ? startUrl : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function getStringField(obj: Record<string, unknown>, ...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = obj[name]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function getNullableStringField(
+  obj: Record<string, unknown>,
+  ...names: string[]
+): string | null | undefined {
+  for (const name of names) {
+    const value = obj[name]
+    if (typeof value === 'string' || value === null) return value
+  }
+  return undefined
+}
+
+function getObjectField(obj: Record<string, unknown>, name: string): Record<string, unknown> | undefined {
+  const value = obj[name]
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
 function normalizeKamAccount(item: unknown): unknown {
   if (typeof item !== 'object' || item === null) return item
   const obj = item as Record<string, unknown>
-  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
-    const userId =
-      typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
-    const nickname =
-      typeof obj.nickname === 'string'
-        ? obj.nickname
-        : typeof obj.label === 'string'
-          ? (obj.label as string)
-          : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const provider =
-      typeof obj.provider === 'string'
-        ? obj.provider
-        : typeof obj.idp === 'string'
-          ? obj.idp
-          : typeof obj.loginMethod === 'string'
-            ? obj.loginMethod
-            : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
 
-    return {
-      email,
-      userId,
-      nickname,
+  const credentialsObj = getObjectField(obj, 'credentials')
+  const source = credentialsObj || obj
+  const refreshToken = getStringField(source, 'refreshToken', 'refresh_token')
+  if (!refreshToken) return item
+
+  const email = getStringField(obj, 'email')
+  const userId = getNullableStringField(obj, 'userId', 'user_id')
+  const nickname = getStringField(obj, 'nickname', 'label')
+  const status = getStringField(obj, 'status')
+  const machineId =
+    getStringField(obj, 'machineId', 'machine_id') ||
+    getStringField(source, 'machineId', 'machine_id')
+  const clientId = getStringField(source, 'clientId', 'client_id')
+  const clientSecret = getStringField(source, 'clientSecret', 'client_secret')
+  const region = getStringField(source, 'region')
+  const authRegion = getStringField(source, 'authRegion', 'auth_region')
+  const apiRegion = getStringField(source, 'apiRegion', 'api_region')
+  const accountProfileArn = getStringField(obj, 'profileArn', 'profile_arn')
+  const profileArn = getStringField(source, 'profileArn', 'profile_arn') || accountProfileArn
+  const authMethod = getStringField(source, 'authMethod', 'auth_method')
+  const provider =
+    getStringField(source, 'provider', 'idp', 'loginMethod', 'login_method') ||
+    getStringField(obj, 'provider', 'idp', 'loginMethod', 'login_method')
+  const startUrl =
+    getStringField(source, 'startUrl', 'start_url') ||
+    extractStartUrlFromClientSecret(clientSecret)
+
+  return {
+    email,
+    userId,
+    nickname,
+    provider,
+    status,
+    machineId,
+    profileArn: accountProfileArn || profileArn,
+    credentials: {
+      refreshToken,
+      clientId,
+      clientSecret,
+      region,
+      authRegion,
+      apiRegion,
+      profileArn,
+      authMethod,
       provider,
-      status,
-      machineId,
-      credentials: {
-        refreshToken: obj.refreshToken,
-        clientId,
-        clientSecret,
-        region,
-        authMethod,
-        provider,
-        startUrl,
-      },
-    }
+      startUrl,
+    },
   }
-  return item
 }
 
 // 校验元素是否为有效的 KAM 账号结构
@@ -130,8 +193,8 @@ function parseKamJson(raw: string): KamAccount[] {
   else if (parsed.credentials && typeof parsed.credentials === 'object') {
     rawItems = [parsed]
   }
-  // 单个账号对象（新格式，refreshToken 平铺）
-  else if (typeof parsed.refreshToken === 'string') {
+  // 单个账号对象（新格式，refreshToken/refresh_token 平铺）
+  else if (typeof parsed.refreshToken === 'string' || typeof parsed.refresh_token === 'string') {
     rawItems = [parsed]
   }
   else {
@@ -143,12 +206,12 @@ function parseKamJson(raw: string): KamAccount[] {
   const validAccounts = normalizedItems.filter(isValidKamAccount)
 
   if (rawItems.length > 0 && validAccounts.length === 0) {
-    throw new Error(`共 ${rawItems.length} 条记录，但均缺少有效的 credentials.refreshToken`)
+    throw new Error(`共 ${rawItems.length} 条记录，但均缺少有效的 credentials.refreshToken/refresh_token`)
   }
 
   if (validAccounts.length < rawItems.length) {
     const skipped = rawItems.length - validAccounts.length
-    console.warn(`KAM 导入：跳过 ${skipped} 条缺少有效 credentials.refreshToken 的记录`)
+    console.warn(`KAM 导入：跳过 ${skipped} 条缺少有效 credentials.refreshToken/refresh_token 的记录`)
   }
 
   return validAccounts
@@ -281,6 +344,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const startUrl = cred.startUrl?.trim() || extractStartUrlFromClientSecret(clientSecret)
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -291,7 +355,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             refreshToken: token,
             authMethod,
             provider: cred.provider?.trim() || account.provider?.trim() || account.idp?.trim() || undefined,
-            authRegion: cred.region?.trim() || undefined,
+            startUrl,
+            profileArn: cred.profileArn?.trim() || account.profileArn?.trim() || undefined,
+            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+            apiRegion: cred.apiRegion?.trim() || normalizeUsageApiRegion(cred.region),
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
@@ -430,7 +497,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "profileArn": "...",\n    "startUrl": "...",\n    "region": "us-east-1"\n  }\n]\n\n也兼容 Windows/IDE 导出的 snake_case 字段：refresh_token、client_id、client_secret、profile_arn、start_url、machine_id。\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "profileArn": "...",\n        "startUrl": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

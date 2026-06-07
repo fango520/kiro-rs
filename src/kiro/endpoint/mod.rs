@@ -28,6 +28,20 @@ pub trait KiroEndpoint: Send + Sync {
     /// MCP endpoint URL
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String;
 
+    /// ListAvailableModels endpoint URL.
+    ///
+    /// 返回 `None` 表示该端点暂不支持动态模型发现。
+    fn models_url(&self, _ctx: &RequestContext<'_>) -> Option<String> {
+        None
+    }
+
+    /// ListAvailableProfiles endpoint URL.
+    ///
+    /// 返回 `None` 表示该端点暂不支持 profile 自动发现。
+    fn profiles_url(&self, _ctx: &RequestContext<'_>) -> Option<String> {
+        None
+    }
+
     /// 装饰 API 请求的端点特有 header
     ///
     /// Provider 已经设置好 URL、content-type、Connection 和 body；
@@ -36,6 +50,16 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 装饰 MCP 请求的端点特有 header
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
+
+    /// 装饰 ListAvailableModels 请求的端点特有 header。
+    fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        self.decorate_api(req, ctx)
+    }
+
+    /// 装饰 ListAvailableProfiles 请求的端点特有 header。
+    fn decorate_profiles(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        self.decorate_api(req, ctx)
+    }
 
     /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String;

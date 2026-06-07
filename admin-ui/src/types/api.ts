@@ -69,6 +69,8 @@ export interface AddCredentialRequest {
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key'
   provider?: string
+  startUrl?: string
+  profileArn?: string
   clientId?: string
   clientSecret?: string
   priority?: number

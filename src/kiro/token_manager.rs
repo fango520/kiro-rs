@@ -24,6 +24,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use reqwest::StatusCode;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -118,20 +119,8 @@ pub(crate) async fn refresh_token(
 
     validate_refresh_token(credentials)?;
 
-    // 根据 auth_method 选择刷新方式
-    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
-    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
-            "idc"
-        } else {
-            "social"
-        }
-    });
-
-    if auth_method.eq_ignore_ascii_case("idc")
-        || auth_method.eq_ignore_ascii_case("builder-id")
-        || auth_method.eq_ignore_ascii_case("iam")
-    {
+    // 根据 auth_method/clientId/clientSecret 选择刷新方式。
+    if credentials.is_idc_auth() {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
@@ -311,12 +300,101 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 同步更新 profile_arn（如果 IdC 响应中包含）
-    if let Some(profile_arn) = data.profile_arn {
-        new_credentials.profile_arn = Some(profile_arn);
+    Ok(new_credentials)
+}
+
+fn normalize_usage_api_region(region: &str) -> &'static str {
+    let region = region.trim();
+    if region.to_ascii_lowercase().starts_with("eu-") {
+        "eu-central-1"
+    } else {
+        "us-east-1"
+    }
+}
+
+fn push_unique_region(regions: &mut Vec<String>, region: &str) {
+    if !regions.iter().any(|existing| existing == region) {
+        regions.push(region.to_string());
+    }
+}
+
+fn usage_api_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
+    let primary_source = credentials
+        .api_region
+        .as_deref()
+        .or(credentials.auth_region.as_deref())
+        .or(credentials.region.as_deref())
+        .or(config.api_region.as_deref())
+        .unwrap_or(config.effective_api_region());
+
+    let primary = normalize_usage_api_region(primary_source);
+    let fallback = if primary == "eu-central-1" {
+        "us-east-1"
+    } else {
+        "eu-central-1"
+    };
+
+    let mut regions = Vec::new();
+    push_unique_region(&mut regions, primary);
+    push_unique_region(&mut regions, fallback);
+    regions
+}
+
+fn usage_profile_arn_candidates(credentials: &KiroCredentials) -> Vec<Option<String>> {
+    if credentials.is_idc_auth() {
+        return vec![None];
     }
 
-    Ok(new_credentials)
+    match credentials.profile_arn.as_deref().map(str::trim) {
+        Some(profile_arn) if !profile_arn.is_empty() => vec![Some(profile_arn.to_string()), None],
+        _ => vec![None],
+    }
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
+    let mut url = format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    );
+
+    if let Some(profile_arn) = profile_arn {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    url
+}
+
+fn usage_limits_user_agents(machine_id: &str) -> (String, String) {
+    // KAM uses the older CodeWhisperer Streaming UA for GetUsageLimits. Enterprise
+    // tokens can be rejected as "Invalid profileArn" with the newer runtime UA.
+    let user_agent = format!(
+        "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18-{}",
+        machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", machine_id);
+    (user_agent, amz_user_agent)
+}
+
+struct UsageLimitsHttpError {
+    status: StatusCode,
+    body: String,
+}
+
+impl UsageLimitsHttpError {
+    fn is_invalid_profile_arn(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST && self.body.contains("Invalid profileArn")
+    }
+
+    fn message(&self) -> String {
+        let error_msg = match self.status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取使用额度",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取使用额度失败",
+        };
+        format!("{}: {} {}", error_msg, self.status, self.body)
+    }
 }
 
 /// 获取使用额度信息
@@ -328,68 +406,75 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
-    );
-
-    // 最新 Kiro 客户端在缺失 profileArn 时也会按认证方式补默认 ARN。
-    if let Some(profile_arn) = credentials.resolved_profile_arn() {
-        url.push_str(&format!(
-            "&profileArn={}",
-            urlencoding::encode(&profile_arn)
-        ));
-    }
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let (user_agent, amz_user_agent) = usage_limits_user_agents(&machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
+    let regions = usage_api_region_candidates(credentials, config);
+    let profile_arns = usage_profile_arn_candidates(credentials);
+    let mut last_retryable_error: Option<UsageLimitsHttpError> = None;
 
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    for region in regions {
+        let host = format!("q.{}.amazonaws.com", region);
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+        for profile_arn in &profile_arns {
+            let url = usage_limits_url(&host, profile_arn.as_deref());
+            let mut request = client
+                .get(&url)
+                .header("Accept", "application/json")
+                .header("x-amz-user-agent", &amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &host)
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Connection", "close");
+
+            if credentials.is_api_key_credential() {
+                request = request.header("tokentype", "API_KEY");
+            }
+
+            let response = request.send().await?;
+            let status = response.status();
+            if status.is_success() {
+                let data: UsageLimitsResponse = response.json().await?;
+                return Ok(data);
+            }
+
+            let body_text = response.text().await.unwrap_or_default();
+            let error = UsageLimitsHttpError {
+                status,
+                body: body_text,
+            };
+
+            if status.as_u16() == 403 {
+                tracing::debug!(
+                    "getUsageLimits 返回 403，准备按 KAM 兼容策略重试: region={}, with_profile_arn={}",
+                    region,
+                    profile_arn.is_some()
+                );
+                last_retryable_error = Some(error);
+                continue;
+            }
+
+            if profile_arn.is_some() && error.is_invalid_profile_arn() {
+                tracing::debug!(
+                    "getUsageLimits 返回 Invalid profileArn，准备不带 profileArn 重试: region={}",
+                    region
+                );
+                last_retryable_error = Some(error);
+                continue;
+            }
+
+            bail!("{}", error.message());
+        }
     }
 
-    let response = request.send().await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        let error_msg = match status.as_u16() {
-            401 => "认证失败，Token 无效或已过期",
-            403 => "权限不足，无法获取使用额度",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
-            _ => "获取使用额度失败",
-        };
-        bail!("{}: {} {}", error_msg, status, body_text);
+    if let Some(error) = last_retryable_error {
+        bail!("{}", error.message());
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
-    Ok(data)
+    bail!("获取使用额度失败: 没有可用的 Kiro REST API 端点")
 }
 
 // ============================================================================
@@ -524,16 +609,26 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// balanced 模式下的会话到凭据绑定，避免同一对话在账号之间来回漂移
+    session_affinity: Mutex<HashMap<String, SessionAffinityEntry>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
 }
 
+#[derive(Clone)]
+struct SessionAffinityEntry {
+    credential_id: u64,
+    last_used_at: Instant,
+}
+
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话亲和有效期，避免长期运行进程积累无限会话 key
+const SESSION_AFFINITY_TTL: StdDuration = StdDuration::from_secs(2 * 60 * 60);
 
 /// API 调用上下文
 ///
@@ -655,6 +750,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            session_affinity: Mutex::new(HashMap::new()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -699,24 +795,10 @@ impl MultiTokenManager {
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| !e.disabled && Self::credential_supports_model(&e.credentials, model))
             .collect();
 
         if available.is_empty() {
@@ -744,6 +826,85 @@ impl MultiTokenManager {
         }
     }
 
+    fn credential_supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        !is_opus || credentials.supports_opus()
+    }
+
+    fn is_balanced_mode(&self) -> bool {
+        self.load_balancing_mode.lock().as_str() == "balanced"
+    }
+
+    fn normalize_session_key(session_key: Option<&str>) -> Option<&str> {
+        session_key
+            .map(str::trim)
+            .and_then(|key| (!key.is_empty()).then_some(key))
+    }
+
+    fn prune_session_affinity_locked(map: &mut HashMap<String, SessionAffinityEntry>) {
+        let now = Instant::now();
+        map.retain(|_, entry| now.duration_since(entry.last_used_at) <= SESSION_AFFINITY_TTL);
+    }
+
+    fn credential_for_session(
+        &self,
+        session_key: &str,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let credential_id = {
+            let mut affinity = self.session_affinity.lock();
+            Self::prune_session_affinity_locked(&mut affinity);
+            affinity.get(session_key).map(|entry| entry.credential_id)
+        }?;
+
+        let hit = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| {
+                    e.id == credential_id
+                        && !e.disabled
+                        && Self::credential_supports_model(&e.credentials, model)
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+        };
+
+        if hit.is_none() {
+            self.clear_session_affinity(session_key);
+        }
+
+        hit
+    }
+
+    fn remember_session_affinity(&self, session_key: &str, credential_id: u64) {
+        let mut affinity = self.session_affinity.lock();
+        Self::prune_session_affinity_locked(&mut affinity);
+        affinity.insert(
+            session_key.to_string(),
+            SessionAffinityEntry {
+                credential_id,
+                last_used_at: Instant::now(),
+            },
+        );
+    }
+
+    fn clear_session_affinity(&self, session_key: &str) {
+        self.session_affinity.lock().remove(session_key);
+    }
+
+    fn clear_session_affinity_for_credential(&self, credential_id: u64) {
+        self.session_affinity
+            .lock()
+            .retain(|_, entry| entry.credential_id != credential_id);
+    }
+
+    fn clear_all_session_affinity(&self) {
+        self.session_affinity.lock().clear();
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -755,6 +916,18 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session(model, None).await
+    }
+
+    /// 获取 API 调用上下文，并在 balanced 模式下按会话绑定凭据。
+    ///
+    /// 同一个 `session_key` 会尽量复用同一凭据，避免同一对话在不同账号之间切换。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        let session_key = Self::normalize_session_key(session_key);
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -771,20 +944,30 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                let session_hit = if is_balanced {
+                    session_key.and_then(|key| self.credential_for_session(key, model))
+                } else {
+                    None
+                };
+
+                // balanced 模式：有会话绑定时优先复用绑定凭据，否则重新均衡选择
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if session_hit.is_some() || is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && Self::credential_supports_model(&e.credentials, model)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
-                if let Some(hit) = current_hit {
+                if let Some(hit) = session_hit.or(current_hit) {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
@@ -830,9 +1013,17 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    if self.is_balanced_mode() {
+                        if let Some(session_key) = session_key {
+                            self.remember_session_affinity(session_key, ctx.id);
+                        }
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    if let Some(session_key) = session_key {
+                        self.clear_session_affinity(session_key);
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -935,7 +1126,7 @@ impl MultiTokenManager {
                     }
                 }
 
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
+                // 回写凭据到文件，失败只记录警告
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
@@ -972,20 +1163,18 @@ impl MultiTokenManager {
     /// 将凭据列表回写到源文件
     ///
     /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
     /// - credentials_path 已设置
+    ///
+    /// 写回格式：
+    /// - 源文件是单凭据格式且当前只有 1 个凭据：写回单对象
+    /// - 其他情况：写回数组
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -1008,7 +1197,11 @@ impl MultiTokenManager {
         };
 
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = if !self.is_multiple_format && credentials.len() == 1 {
+            serde_json::to_string_pretty(&credentials[0]).context("序列化凭据失败")?
+        } else {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1027,6 +1220,33 @@ impl MultiTokenManager {
         self.credentials_path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    /// 更新并持久化指定凭据的 profileArn。
+    ///
+    /// 用于 KAM 1.7.5 同步的 Enterprise profileArn 自愈流程：
+    /// 运行时通过 ListAvailableProfiles 获取真实 ARN 后写回 credentials。
+    pub fn update_profile_arn(&self, id: u64, profile_arn: String) -> anyhow::Result<bool> {
+        let changed = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if entry.credentials.profile_arn.as_deref() == Some(profile_arn.as_str()) {
+                false
+            } else {
+                entry.credentials.profile_arn = Some(profile_arn);
+                true
+            }
+        };
+
+        if changed {
+            self.persist_credentials()?;
+        }
+
+        Ok(changed)
     }
 
     /// 统计数据文件路径
@@ -1199,6 +1419,7 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1249,6 +1470,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1283,35 +1505,36 @@ impl MultiTokenManager {
             );
 
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-
-            tracing::error!(
-                "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
-                id,
-                refresh_failure_count
-            );
-
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
+                entries.iter().any(|e| !e.disabled)
             } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+
+                tracing::error!(
+                    "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
+                    id,
+                    refresh_failure_count
+                );
+
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    true
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    false
+                }
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1360,6 +1583,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1489,6 +1713,9 @@ impl MultiTokenManager {
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
+        }
+        if disabled {
+            self.clear_session_affinity_for_credential(id);
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1658,7 +1885,15 @@ impl MultiTokenManager {
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
-    pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+    pub async fn add_credential(&self, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        new_cred.canonicalize_auth_method();
+        if new_cred.machine_id.is_none() {
+            new_cred.machine_id = Some(machine_id::generate_from_credentials(
+                &new_cred,
+                &self.config,
+            ));
+        }
+
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -1742,6 +1977,10 @@ impl MultiTokenManager {
             }
         });
         validated_cred.provider = new_cred.provider;
+        validated_cred.start_url = new_cred.start_url;
+        if new_cred.profile_arn.is_some() {
+            validated_cred.profile_arn = new_cred.profile_arn;
+        }
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
@@ -1820,6 +2059,7 @@ impl MultiTokenManager {
         if was_current {
             self.select_highest_priority();
         }
+        self.clear_session_affinity_for_credential(id);
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
         {
@@ -1919,6 +2159,7 @@ impl MultiTokenManager {
         }
 
         *self.load_balancing_mode.lock() = mode.clone();
+        self.clear_all_session_affinity();
 
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;
@@ -2310,6 +2551,75 @@ mod tests {
         std::fs::remove_file(&config_path).unwrap();
     }
 
+    #[test]
+    fn test_single_credentials_format_persists_as_object() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-single-credentials-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let _manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        let persisted = std::fs::read_to_string(&credentials_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert!(json.is_object());
+        assert!(json.get("machineId").and_then(|v| v.as_str()).is_some());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_balanced_mode_uses_session_affinity() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test_1".to_string()),
+            ..Default::default()
+        };
+        cred1.priority = 0;
+        let mut cred2 = KiroCredentials {
+            id: Some(2),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test_2".to_string()),
+            ..Default::default()
+        };
+        cred2.priority = 1;
+
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, true).unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("conversation-a"))
+            .await
+            .unwrap();
+        manager.report_success(first.id);
+
+        let same_session = manager
+            .acquire_context_for_session(None, Some("conversation-a"))
+            .await
+            .unwrap();
+        assert_eq!(same_session.id, first.id);
+
+        let other_session = manager
+            .acquire_context_for_session(None, Some("conversation-b"))
+            .await
+            .unwrap();
+        assert_ne!(other_session.id, first.id);
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -2459,6 +2769,98 @@ mod tests {
             err
         );
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_usage_api_region_candidates_use_kam_enterprise_mapping_for_eu_auth_region() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("eu-west-1".to_string());
+
+        assert_eq!(
+            usage_api_region_candidates(&credentials, &config),
+            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_usage_api_region_candidates_use_kam_mapping_for_non_eu_region() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("ap-northeast-1".to_string());
+
+        assert_eq!(
+            usage_api_region_candidates(&credentials, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_usage_api_region_candidates_api_region_takes_priority() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("eu-west-1".to_string());
+        credentials.api_region = Some("us-east-1".to_string());
+
+        assert_eq!(
+            usage_api_region_candidates(&credentials, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_do_not_inject_default_profile_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![None]);
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_ignore_idc_profile_arn_like_kam() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:explicit".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![None]);
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_retry_without_explicit_social_profile_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Github".to_string()),
+            profile_arn: Some("arn:explicit".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![Some("arn:explicit".to_string()), None]);
+    }
+
+    #[test]
+    fn test_usage_limits_user_agents_match_kam_rest_request() {
+        let machine_id = "a".repeat(64);
+        let (user_agent, amz_user_agent) = usage_limits_user_agents(&machine_id);
+
+        assert!(user_agent.contains("aws-sdk-js/1.0.18"));
+        assert!(user_agent.contains("api/codewhispererstreaming#1.0.18"));
+        assert!(user_agent.contains("KiroIDE-0.6.18-"));
+        assert!(user_agent.ends_with(&machine_id));
+        assert_eq!(
+            amz_user_agent,
+            format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", machine_id)
+        );
     }
 
     // ============ 凭据级 Region 优先级测试 ============
