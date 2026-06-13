@@ -112,7 +112,8 @@ pub struct KiroCredentials {
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID 配置（可选）
-    /// 未配置时回退到 config.json 的 machineId；都未配置时运行时生成随机值并写回
+    /// 未配置时回退到 config.json 的 machineId；都未配置时运行时生成随机值并写回。
+    /// 多凭据场景下若与前面的凭据重复，会重新生成唯一值。
     #[serde(alias = "machine_id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
@@ -209,6 +210,10 @@ fn valid_explicit_profile_arn(value: Option<&str>) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+fn has_non_empty_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
 }
 
 /// 凭据配置（支持单对象或数组格式）
@@ -320,14 +325,35 @@ impl KiroCredentials {
     }
 
     pub fn canonicalize_auth_method(&mut self) {
-        let auth_method = match &self.auth_method {
-            Some(m) => m,
-            None => return,
-        };
+        if let Some(auth_method) = self.auth_method.as_deref() {
+            let canonical = canonicalize_auth_method_value(auth_method);
+            if canonical != auth_method {
+                self.auth_method = Some(canonical.to_string());
+            }
+        }
 
-        let canonical = canonicalize_auth_method_value(auth_method);
-        if canonical != auth_method {
-            self.auth_method = Some(canonical.to_string());
+        self.infer_builder_id_provider();
+    }
+
+    fn infer_builder_id_provider(&mut self) {
+        if self.is_api_key_credential()
+            || has_non_empty_value(self.provider.as_deref())
+            || has_non_empty_value(self.start_url.as_deref())
+            || valid_explicit_profile_arn(self.profile_arn.as_deref()).is_some()
+        {
+            return;
+        }
+
+        if self
+            .auth_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"))
+        {
+            return;
+        }
+
+        if self.is_idc_auth() {
+            self.provider = Some("BuilderId".to_string());
         }
     }
 
@@ -446,7 +472,7 @@ impl KiroCredentials {
 
     /// 判断是否应该尝试通过 ListAvailableProfiles 自动获取真实 profileArn。
     pub fn should_fetch_profile_arn(&self) -> bool {
-        if self.is_api_key_credential() {
+        if self.is_api_key_credential() || self.is_builder_id_auth() {
             return false;
         }
 
@@ -459,12 +485,16 @@ impl KiroCredentials {
 
     /// 获取请求 Kiro API 时应使用的 profileArn。
     ///
-    /// 与 KAM 1.7.5 的 resolveProfileArn 保持一致：
-    /// 显式真实 ARN > Enterprise fallback > Social 固定 ARN > Builder ID 占位符。
-    /// 注意：Builder ID 占位符只适合 ListAvailableModels，不适合流式生成接口。
+    /// Builder ID 必须使用 Kiro IDE 官方占位 ARN；带真实 profile ARN 会被
+    /// 上游生成接口判为 bearer token invalid。Enterprise / Social 仍保留真实
+    /// ARN 或各自固定 fallback。
     pub fn resolved_profile_arn(&self) -> Option<String> {
         if self.is_api_key_credential() {
             return None;
+        }
+
+        if self.is_builder_id_auth() {
+            return Some(KIRO_BUILDER_ID_PROFILE_ARN.to_string());
         }
 
         if let Some(profile_arn) = valid_explicit_profile_arn(self.profile_arn.as_deref()) {
@@ -484,14 +514,10 @@ impl KiroCredentials {
 
     /// 获取流式生成请求中应传递的 profileArn。
     ///
-    /// Enterprise fallback / 真实 ARN / Social ARN 都会发送；Builder ID 占位符会移除。
+    /// Enterprise / Social / Builder ID 都需要发送对应 profileArn。Builder ID
+    /// 发送的是官方占位 ARN，不是配置中可能携带的真实 ARN。
     pub fn resolved_stream_profile_arn(&self) -> Option<String> {
-        let arn = self.resolved_profile_arn()?;
-        if Self::is_placeholder_profile_arn(&arn) && !self.is_enterprise_auth() {
-            None
-        } else {
-            Some(arn)
-        }
+        self.resolved_profile_arn()
     }
 
     /// 检查凭据是否支持 Opus 模型
@@ -670,7 +696,10 @@ mod tests {
             creds.resolved_profile_arn().as_deref(),
             Some(KIRO_BUILDER_ID_PROFILE_ARN)
         );
-        assert_eq!(creds.resolved_stream_profile_arn(), None);
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
     }
 
     #[test]
@@ -688,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_profile_arn_preserves_explicit_value_for_builder_id() {
+    fn test_resolved_profile_arn_uses_placeholder_for_builder_id() {
         let creds = KiroCredentials {
             auth_method: Some("idc".to_string()),
             provider: Some("BuilderId".to_string()),
@@ -701,12 +730,48 @@ mod tests {
         assert!(creds.is_builder_id_auth());
         assert_eq!(
             creds.resolved_profile_arn().as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
         );
         assert_eq!(
             creds.resolved_stream_profile_arn().as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
         );
+    }
+
+    #[test]
+    fn test_canonicalize_infers_builder_id_provider_for_oidc_credentials() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        creds.canonicalize_auth_method();
+
+        assert_eq!(creds.provider.as_deref(), Some("BuilderId"));
+        assert!(creds.is_builder_id_auth());
+        assert!(!creds.should_fetch_profile_arn());
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_does_not_infer_builder_id_when_real_profile_arn_exists() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
+            ..Default::default()
+        };
+
+        creds.canonicalize_auth_method();
+
+        assert_eq!(creds.provider, None);
+        assert!(!creds.is_builder_id_auth());
     }
 
     #[test]
@@ -749,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_profile_arn_keeps_builder_id_placeholder_for_models_only() {
+    fn test_resolved_profile_arn_keeps_builder_id_placeholder_for_streaming() {
         let creds = KiroCredentials {
             auth_method: Some("idc".to_string()),
             profile_arn: Some(KIRO_BUILDER_ID_PROFILE_ARN.to_string()),
@@ -762,11 +827,14 @@ mod tests {
             creds.resolved_profile_arn().as_deref(),
             Some(KIRO_BUILDER_ID_PROFILE_ARN)
         );
-        assert_eq!(creds.resolved_stream_profile_arn(), None);
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
     }
 
     #[test]
-    fn test_resolved_stream_profile_arn_omits_builder_placeholder() {
+    fn test_resolved_stream_profile_arn_keeps_builder_placeholder() {
         let creds = KiroCredentials {
             auth_method: Some("idc".to_string()),
             client_id: Some("client".to_string()),
@@ -778,7 +846,10 @@ mod tests {
             creds.resolved_profile_arn().as_deref(),
             Some(KIRO_BUILDER_ID_PROFILE_ARN)
         );
-        assert_eq!(creds.resolved_stream_profile_arn(), None);
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
     }
 
     #[test]

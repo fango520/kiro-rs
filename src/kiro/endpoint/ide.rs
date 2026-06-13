@@ -2,8 +2,9 @@
 //!
 //! 对应 KAM 1.7.5 的反代行为：
 //! - Enterprise / External IdP 流式生成走 `codewhisperer.{region}.amazonaws.com`
+//! - Builder ID / Social 流式生成走 `q.{region}.amazonaws.com`
 //! - 模型列表走 `q.{region}.amazonaws.com/ListAvailableModels`
-//! - Builder ID 的占位 profileArn 不会出现在流式生成请求里
+//! - Builder ID 流式生成必须发送官方占位 profileArn
 //!
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
 
@@ -192,8 +193,52 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{IdeEndpoint, inject_profile_arn};
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
     use serde_json::Value;
+
+    fn api_url_for(credentials: &KiroCredentials) -> String {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        endpoint.api_url(&ctx)
+    }
+
+    #[test]
+    fn test_builder_id_api_url_uses_amazonq_host() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            api_url_for(&credentials),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+    }
+
+    #[test]
+    fn test_enterprise_api_url_uses_codewhisperer_host() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("Enterprise".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            api_url_for(&credentials),
+            "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+    }
 
     #[test]
     fn test_inject_profile_arn_with_some() {

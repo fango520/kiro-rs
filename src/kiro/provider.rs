@@ -35,7 +35,7 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 动态模型列表缓存有效期
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-const CODEWHISPERER_DEFAULT_MODEL_ID: &str = "CLAUDE_SONNET_4_20250514_V1_0";
+const KIRO_DEFAULT_MODEL_ID: &str = "claude-sonnet-4.5";
 
 /// Kiro 官方模型信息
 #[derive(Debug, Clone, Deserialize)]
@@ -893,6 +893,69 @@ impl KiroProvider {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     }
 
+    fn normalize_claude_version(model_id: &str) -> String {
+        let lower = model_id.trim().to_ascii_lowercase();
+        let base = lower.strip_suffix("-thinking").unwrap_or(&lower);
+        let parts: Vec<&str> = base.split('-').collect();
+
+        if parts.len() < 3 || parts[0] != "claude" {
+            return lower;
+        }
+
+        let family = parts[1];
+        if !matches!(family, "sonnet" | "haiku" | "opus") {
+            return lower;
+        }
+
+        let major = parts[2];
+        if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+            return lower;
+        }
+
+        if parts.len() >= 4
+            && (1..=2).contains(&parts[3].len())
+            && parts[3].chars().all(|c| c.is_ascii_digit())
+        {
+            return format!("claude-{family}-{major}.{}", parts[3]);
+        }
+
+        lower
+    }
+
+    fn fallback_kiro_model_id(requested_model_id: Option<&str>) -> String {
+        let Some(model_id) = requested_model_id
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            return KIRO_DEFAULT_MODEL_ID.to_string();
+        };
+
+        if Self::is_codewhisperer_model_id(model_id) {
+            return model_id.to_string();
+        }
+
+        let model_id = Self::normalize_claude_version(model_id);
+        let lower = model_id.to_ascii_lowercase();
+
+        match lower.as_str() {
+            "claude-sonnet-4-5" | "claude-sonnet-4.5" => "claude-sonnet-4.5".to_string(),
+            "claude-haiku-4-5" | "claude-haiku-4.5" => "claude-haiku-4.5".to_string(),
+            "claude-opus-4-5" | "claude-opus-4.5" => "claude-opus-4.5".to_string(),
+            "claude-sonnet-4" | "claude-sonnet-4-20250514" => "claude-sonnet-4".to_string(),
+            "claude-3-5-sonnet" | "claude-3-opus" | "gpt-4" | "gpt-4o" | "gpt-4-turbo"
+            | "gpt-3.5-turbo" => KIRO_DEFAULT_MODEL_ID.to_string(),
+            "claude-3-sonnet" => "claude-sonnet-4".to_string(),
+            "claude-3-haiku" => "claude-haiku-4.5".to_string(),
+            _ if lower.starts_with("claude-sonnet-")
+                || lower.starts_with("claude-haiku-")
+                || lower.starts_with("claude-opus-") =>
+            {
+                model_id
+            }
+            _ => KIRO_DEFAULT_MODEL_ID.to_string(),
+        }
+    }
+
     async fn resolve_codewhisperer_model_id(
         &self,
         credentials: &KiroCredentials,
@@ -905,12 +968,13 @@ impl KiroProvider {
             .map(str::trim)
             .filter(|model| !model.is_empty())
         else {
-            return CODEWHISPERER_DEFAULT_MODEL_ID.to_string();
+            return Self::fallback_kiro_model_id(None);
         };
 
         if Self::is_codewhisperer_model_id(model_id) {
             return model_id.to_string();
         }
+        let fallback_model_id = Self::fallback_kiro_model_id(Some(model_id));
 
         let cached_models = {
             let cache = self.model_cache.lock();
@@ -935,19 +999,19 @@ impl KiroProvider {
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "解析 CodeWhisperer modelId 时获取模型列表失败，使用默认模型: {}",
+                        "解析 CodeWhisperer modelId 时获取模型列表失败，使用请求模型回退: {}",
                         err
                     );
-                    return CODEWHISPERER_DEFAULT_MODEL_ID.to_string();
+                    return fallback_model_id;
                 }
             },
         };
 
         models
             .iter()
-            .find(|model| Self::matches_requested_model(model, model_id))
+            .find(|model| Self::matches_requested_model(model, &fallback_model_id))
             .map(|model| model.model_id.clone())
-            .unwrap_or_else(|| CODEWHISPERER_DEFAULT_MODEL_ID.to_string())
+            .unwrap_or(fallback_model_id)
     }
 
     fn apply_payload_model_id(request_body: &str, model_id: &str) -> String {
@@ -998,5 +1062,85 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KiroAvailableModel, KiroProvider};
+
+    #[test]
+    fn fallback_kiro_model_id_keeps_supported_kiro_model() {
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(Some("claude-haiku-4.5")),
+            "claude-haiku-4.5"
+        );
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(Some("claude-sonnet-4.6")),
+            "claude-sonnet-4.6"
+        );
+    }
+
+    #[test]
+    fn fallback_kiro_model_id_normalizes_anthropic_snapshot_model() {
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(Some("claude-haiku-4-5-20251001")),
+            "claude-haiku-4.5"
+        );
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(Some("claude-sonnet-4-5-20250929-thinking")),
+            "claude-sonnet-4.5"
+        );
+    }
+
+    #[test]
+    fn fallback_kiro_model_id_uses_kiro_default_for_unknown_model() {
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(Some("not-a-real-model")),
+            "claude-sonnet-4.5"
+        );
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(None),
+            "claude-sonnet-4.5"
+        );
+    }
+
+    #[test]
+    fn fallback_kiro_model_id_preserves_explicit_codewhisperer_model() {
+        assert_eq!(
+            KiroProvider::fallback_kiro_model_id(Some("CLAUDE_HAIKU_4_5_20251001_V1_0")),
+            "CLAUDE_HAIKU_4_5_20251001_V1_0"
+        );
+    }
+
+    #[test]
+    fn matches_requested_model_accepts_normalized_kiro_model() {
+        let model = KiroAvailableModel {
+            model_id: "claude-haiku-4.5".to_string(),
+            model_name: Some("Claude Haiku 4.5".to_string()),
+            description: None,
+            model_provider: None,
+            token_limits: None,
+        };
+
+        let normalized = KiroProvider::fallback_kiro_model_id(Some("claude-haiku-4-5-20251001"));
+        assert!(KiroProvider::matches_requested_model(&model, &normalized));
+    }
+
+    #[test]
+    fn apply_payload_model_id_updates_current_and_history() {
+        let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"old"}},"history":[{"userInputMessage":{"modelId":"old-history"}},{"assistantResponseMessage":{"content":"ok"}}]}}"#;
+
+        let updated = KiroProvider::apply_payload_model_id(body, "claude-haiku-4.5");
+        let json: serde_json::Value = serde_json::from_str(&updated).unwrap();
+
+        assert_eq!(
+            json.pointer("/conversationState/currentMessage/userInputMessage/modelId"),
+            Some(&serde_json::Value::String("claude-haiku-4.5".to_string()))
+        );
+        assert_eq!(
+            json.pointer("/conversationState/history/0/userInputMessage/modelId"),
+            Some(&serde_json::Value::String("claude-haiku-4.5".to_string()))
+        );
     }
 }

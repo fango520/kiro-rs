@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +25,50 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use reqwest::StatusCode;
+
+fn collect_machine_ids(entries: &[CredentialEntry]) -> HashSet<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .credentials
+                .machine_id
+                .as_deref()
+                .and_then(machine_id::normalize_machine_id)
+        })
+        .collect()
+}
+
+fn generate_unused_random_machine_id(used_machine_ids: &HashSet<String>) -> String {
+    loop {
+        let candidate = machine_id::generate_random_machine_id();
+        if !used_machine_ids.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn ensure_unique_machine_id(
+    credentials: &mut KiroCredentials,
+    config: &Config,
+    used_machine_ids: &mut HashSet<String>,
+) -> bool {
+    let previous_machine_id = credentials.machine_id.clone();
+    let mut resolved_machine_id = machine_id::generate_from_credentials(credentials, config);
+
+    if used_machine_ids.contains(&resolved_machine_id) {
+        tracing::warn!(
+            credential_id = ?credentials.id,
+            "凭据 machineId 与已有凭据重复，重新生成唯一设备 ID"
+        );
+        resolved_machine_id = generate_unused_random_machine_id(used_machine_ids);
+    }
+
+    used_machine_ids.insert(resolved_machine_id.clone());
+    let changed = previous_machine_id.as_deref() != Some(resolved_machine_id.as_str());
+    credentials.machine_id = Some(resolved_machine_id);
+    changed
+}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -341,13 +385,25 @@ fn usage_api_region_candidates(credentials: &KiroCredentials, config: &Config) -
 }
 
 fn usage_profile_arn_candidates(credentials: &KiroCredentials) -> Vec<Option<String>> {
+    let explicit_profile_arn = credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile_arn| !profile_arn.is_empty())
+        .map(str::to_string);
+
     if credentials.is_idc_auth() {
+        if credentials.is_enterprise_auth() {
+            if let Some(profile_arn) = explicit_profile_arn {
+                return vec![Some(profile_arn), None];
+            }
+        }
         return vec![None];
     }
 
-    match credentials.profile_arn.as_deref().map(str::trim) {
-        Some(profile_arn) if !profile_arn.is_empty() => vec![Some(profile_arn.to_string()), None],
-        _ => vec![None],
+    match explicit_profile_arn {
+        Some(profile_arn) => vec![Some(profile_arn), None],
+        None => vec![None],
     }
 }
 
@@ -666,6 +722,7 @@ impl MultiTokenManager {
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;
+        let mut used_machine_ids = HashSet::new();
 
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
@@ -678,9 +735,7 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
-                if cred.machine_id.is_none() {
-                    cred.machine_id =
-                        Some(machine_id::generate_from_credentials(&cred, config_ref));
+                if ensure_unique_machine_id(&mut cred, config_ref, &mut used_machine_ids) {
                     has_new_machine_ids = true;
                 }
                 CredentialEntry {
@@ -1887,11 +1942,10 @@ impl MultiTokenManager {
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, mut new_cred: KiroCredentials) -> anyhow::Result<u64> {
         new_cred.canonicalize_auth_method();
-        if new_cred.machine_id.is_none() {
-            new_cred.machine_id = Some(machine_id::generate_from_credentials(
-                &new_cred,
-                &self.config,
-            ));
+        {
+            let entries = self.entries.lock();
+            let mut used_machine_ids = collect_machine_ids(entries.as_slice());
+            ensure_unique_machine_id(&mut new_cred, &self.config, &mut used_machine_ids);
         }
 
         // 1. 基本验证
@@ -1960,14 +2014,7 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
-        // 4. 分配新 ID
-        let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
-        };
-
-        // 5. 设置 ID 并保留用户输入的元数据
-        validated_cred.id = Some(new_id);
+        // 4. 保留用户输入的元数据
         validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
@@ -1993,8 +2040,15 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
-        {
+        // 5. 分配新 ID，最终确认 machineId 不与已有凭据重复，并加入 entries
+        let new_id = {
             let mut entries = self.entries.lock();
+            let new_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            validated_cred.id = Some(new_id);
+
+            let mut used_machine_ids = collect_machine_ids(entries.as_slice());
+            ensure_unique_machine_id(&mut validated_cred, &self.config, &mut used_machine_ids);
+
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2005,7 +2059,8 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
             });
-        }
+            new_id
+        };
 
         // 6. 持久化
         self.persist_credentials()?;
@@ -2182,6 +2237,11 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_machine_id_format(machine_id: &str) {
+        assert_eq!(machine_id.len(), 64);
+        assert!(machine_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -2579,6 +2639,74 @@ mod tests {
         std::fs::remove_file(&credentials_path).unwrap();
     }
 
+    #[test]
+    fn test_multi_token_manager_assigns_unique_machine_ids() {
+        let global_machine_id = "a".repeat(64);
+        let duplicate_machine_id = "b".repeat(64);
+
+        let mut config = Config::default();
+        config.machine_id = Some(global_machine_id.clone());
+
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let mut cred3 = KiroCredentials::default();
+        cred3.machine_id = Some(duplicate_machine_id.clone());
+        let mut cred4 = KiroCredentials::default();
+        cred4.machine_id = Some(duplicate_machine_id.clone());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2, cred3, cred4], None, None, true)
+                .unwrap();
+        let entries = manager.entries.lock();
+        let machine_ids: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.credentials.machine_id.clone().unwrap())
+            .collect();
+
+        assert_eq!(machine_ids[0], global_machine_id);
+        assert_ne!(machine_ids[1], machine_ids[0]);
+        assert_eq!(machine_ids[2], duplicate_machine_id);
+        assert_ne!(machine_ids[3], duplicate_machine_id);
+
+        let unique_count = machine_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert_eq!(unique_count, machine_ids.len());
+        for machine_id in &machine_ids {
+            assert_machine_id_format(machine_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_rewrites_duplicate_machine_id() {
+        let duplicate_machine_id = "c".repeat(64);
+        let existing = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_existing".to_string()),
+            machine_id: Some(duplicate_machine_id.clone()),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![existing], None, None, true).unwrap();
+
+        let new_cred = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_new".to_string()),
+            machine_id: Some(duplicate_machine_id.clone()),
+            ..Default::default()
+        };
+
+        let new_id = manager.add_credential(new_cred).await.unwrap();
+        let entries = manager.entries.lock();
+        let added = entries.iter().find(|entry| entry.id == new_id).unwrap();
+        let added_machine_id = added.credentials.machine_id.as_deref().unwrap();
+
+        assert_ne!(added_machine_id, duplicate_machine_id);
+        assert_machine_id_format(added_machine_id);
+    }
+
     #[tokio::test]
     async fn test_balanced_mode_uses_session_affinity() {
         let mut config = Config::default();
@@ -2822,7 +2950,7 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_profile_arn_candidates_ignore_idc_profile_arn_like_kam() {
+    fn test_usage_profile_arn_candidates_ignore_builder_id_profile_arn_like_kam() {
         let credentials = KiroCredentials {
             auth_method: Some("idc".to_string()),
             profile_arn: Some("arn:explicit".to_string()),
@@ -2833,6 +2961,21 @@ mod tests {
 
         let candidates = usage_profile_arn_candidates(&credentials);
         assert_eq!(candidates, vec![None]);
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_use_enterprise_profile_arn_first() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:explicit".to_string()),
+            start_url: Some("https://d-example.awsapps.com/start/".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![Some("arn:explicit".to_string()), None]);
     }
 
     #[test]

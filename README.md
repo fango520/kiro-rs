@@ -191,6 +191,8 @@ docker-compose up
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
+多凭据场景下，`machineId` 会按凭据去重：凭据级 `machineId` 优先；缺失时可使用全局 `config.machineId` 兜底；若某个账号解析出的机器码与前面账号重复，会自动重新生成唯一机器码并写回凭据文件。
+
 完整配置示例：
 
 ```json
