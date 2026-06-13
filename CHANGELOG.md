@@ -1,5 +1,34 @@
 # Changelog
 
+## v2026.6.13 - 2026-06-13
+
+### 发版摘要
+
+本次发版同步 `jp:~/ws/kiro.rs` 的最新非配置改动，重点修复 Builder ID 流式请求路由/profile ARN 行为、Kiro 模型 ID 回退，以及多凭据 machineId 去重。
+
+### 重点变更
+
+- Builder ID / Social 流式请求改走 `q.{region}.amazonaws.com`，Enterprise / External IdP 继续走 `codewhisperer.{region}.amazonaws.com`。
+- Builder ID 流式请求保留官方占位 `profileArn`，避免携带真实 ARN 被上游判为 bearer token invalid。
+- 缺少 provider、start URL 和真实 profile ARN 的 OIDC 凭据会推断为 Builder ID，避免错误触发 Enterprise profile 自动发现。
+- Kiro 模型 ID 回退改为当前公开模型名，例如 `claude-sonnet-4.5`，并兼容 `claude-*-4-5-*` 快照名归一化。
+- 多凭据初始化和新增凭据时会确保 `machineId` 唯一；重复时自动生成新的 64 位十六进制 ID 并持久化。
+- README 补充多凭据 `machineId` 去重规则。
+
+### 兼容性说明
+
+- `config/`、`config.json`、凭据文件、缓存文件、生成的 `admin-ui/dist` 和 `node_modules` 未进入本次发版提交。
+- 本次仍未做真实 Kiro Builder ID / Enterprise 网络调用验证，需要在有真实凭据的环境中确认。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo test`，共 `256 passed`
+
+### 逐提交变更
+
+- `8fdaa6d` fix: 同步 Builder ID 路由/profile ARN、Kiro 模型回退和多凭据 machineId 去重改动。
+
 ## v2026.6.7 - 2026-06-07
 
 ### 发版摘要
