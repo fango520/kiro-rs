@@ -4,7 +4,7 @@ use std::convert::Infallible;
 
 use crate::kiro::model::events::Event;
 use crate::api_keys::ApiKeyContext;
-use crate::request_log::RequestLogEntry;
+use crate::request_log::{compact_log_body, RequestLogDetails, RequestLogEntry};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
@@ -48,6 +48,28 @@ fn truncate_error(value: impl ToString) -> String {
     value.chars().take(500).collect()
 }
 
+fn request_details(path: &str, client_request_body: &str) -> RequestLogDetails {
+    RequestLogDetails {
+        method: Some("POST".to_string()),
+        path: Some(path.to_string()),
+        request_body: Some(compact_log_body(client_request_body)),
+        ..Default::default()
+    }
+}
+
+fn attach_upstream_details(
+    mut details: RequestLogDetails,
+    api_result: &crate::kiro::provider::ApiCallResult,
+    upstream_response_body: Option<&str>,
+) -> RequestLogDetails {
+    details.upstream_url = Some(api_result.upstream_url.clone());
+    details.upstream_method = Some(api_result.upstream_method.clone());
+    details.upstream_status = Some(api_result.upstream_status);
+    details.upstream_request_body = Some(compact_log_body(&api_result.upstream_request_body));
+    details.upstream_response_body = upstream_response_body.map(compact_log_body);
+    details
+}
+
 fn log_request(
     state: &AppState,
     api_key_ctx: &ApiKeyContext,
@@ -59,11 +81,13 @@ fn log_request(
     input_tokens: i64,
     output_tokens: i64,
     error: Option<String>,
+    details: Option<RequestLogDetails>,
 ) {
     state.api_key_store.record_usage(&api_key_ctx.id, input_tokens, output_tokens);
     state.request_log_store.record(RequestLogEntry {
         id: String::new(),
         timestamp: String::new(),
+        stage: "key".to_string(),
         api_key_id: api_key_ctx.id.clone(),
         api_key_name: api_key_ctx.name.clone(),
         api_key_prefix: api_key_ctx.key_prefix.clone(),
@@ -77,6 +101,7 @@ fn log_request(
         total_tokens: input_tokens.saturating_add(output_tokens),
         duration_ms: started_at.elapsed().as_millis(),
         error,
+        details: details.unwrap_or_default(),
     });
 }
 
@@ -510,12 +535,13 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    let client_request_body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::SERVICE_UNAVAILABLE, None, 0, 0, Some("Kiro API provider not configured".to_string()));
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::SERVICE_UNAVAILABLE, None, 0, 0, Some("Kiro API provider not configured".to_string()), Some(request_details("/v1/messages", &client_request_body)));
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -576,7 +602,7 @@ pub async fn post_messages(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
-            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::BAD_REQUEST, None, input_tokens as i64, 0, Some(message.clone()));
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::BAD_REQUEST, None, input_tokens as i64, 0, Some(message.clone()), Some(request_details("/v1/messages", &client_request_body)));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -595,7 +621,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::INTERNAL_SERVER_ERROR, None, input_tokens as i64, 0, Some(e.to_string()));
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::INTERNAL_SERVER_ERROR, None, input_tokens as i64, 0, Some(e.to_string()), Some(request_details("/v1/messages", &client_request_body)));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -625,6 +651,7 @@ pub async fn post_messages(
             &api_key_ctx,
             started_at,
             provider,
+            &client_request_body,
             &request_body,
             &payload.model,
             input_tokens,
@@ -644,6 +671,7 @@ pub async fn post_messages(
             &api_key_ctx,
             started_at,
             provider,
+            &client_request_body,
             &request_body,
             &payload.model,
             input_tokens,
@@ -664,6 +692,7 @@ async fn handle_stream_request(
     api_key_ctx: &ApiKeyContext,
     started_at: Instant,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    client_request_body: &str,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -677,11 +706,20 @@ async fn handle_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             let error = truncate_error(&e);
-            log_request(state, api_key_ctx, started_at, model, true, StatusCode::BAD_GATEWAY, None, input_tokens as i64, 0, Some(error));
+            let mut details = request_details("/v1/messages", client_request_body);
+            details.upstream_method = Some("POST".to_string());
+            details.upstream_request_body = Some(compact_log_body(request_body));
+            log_request(state, api_key_ctx, started_at, model, true, StatusCode::BAD_GATEWAY, None, input_tokens as i64, 0, Some(error), Some(details));
             return map_provider_error(e);
         }
     };
-    log_request(state, api_key_ctx, started_at, model, true, StatusCode::OK, Some(api_result.credential_id), input_tokens as i64, 0, None);
+    let mut details = attach_upstream_details(
+        request_details("/v1/messages", client_request_body),
+        &api_result,
+        Some("stream response accepted; body is forwarded to client as SSE"),
+    );
+    details.response_body = Some("stream response accepted; final SSE body is not buffered".to_string());
+    log_request(state, api_key_ctx, started_at, model, true, StatusCode::OK, Some(api_result.credential_id), input_tokens as i64, 0, None, Some(details));
 
     let final_cache_context = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
@@ -839,6 +877,7 @@ async fn handle_non_stream_request(
     api_key_ctx: &ApiKeyContext,
     started_at: Instant,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    client_request_body: &str,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -852,7 +891,10 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             let error = truncate_error(&e);
-            log_request(state, api_key_ctx, started_at, model, false, StatusCode::BAD_GATEWAY, None, input_tokens as i64, 0, Some(error));
+            let mut details = request_details("/v1/messages", client_request_body);
+            details.upstream_method = Some("POST".to_string());
+            details.upstream_request_body = Some(compact_log_body(request_body));
+            log_request(state, api_key_ctx, started_at, model, false, StatusCode::BAD_GATEWAY, None, input_tokens as i64, 0, Some(error), Some(details));
             return map_provider_error(e);
         }
     };
@@ -871,13 +913,21 @@ async fn handle_non_stream_request(
         }
         _ => None,
     };
+    let credential_id = api_result.credential_id;
+    let upstream_details_base = attach_upstream_details(
+        request_details("/v1/messages", client_request_body),
+        &api_result,
+        None,
+    );
 
     // 读取响应体
     let body_bytes = match api_result.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
-            log_request(state, api_key_ctx, started_at, model, false, StatusCode::BAD_GATEWAY, Some(api_result.credential_id), input_tokens as i64, 0, Some(e.to_string()));
+            let mut details = upstream_details_base.clone();
+            details.upstream_response_body = Some("failed to read upstream response body".to_string());
+            log_request(state, api_key_ctx, started_at, model, false, StatusCode::BAD_GATEWAY, Some(credential_id), input_tokens as i64, 0, Some(e.to_string()), Some(details));
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -885,9 +935,10 @@ async fn handle_non_stream_request(
                     format!("读取响应失败: {}", e),
                 )),
             )
-                .into_response();
+            .into_response();
         }
     };
+    let upstream_response_body = String::from_utf8_lossy(&body_bytes).to_string();
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -1109,7 +1160,10 @@ async fn handle_non_stream_request(
         })
     };
 
-    log_request(state, api_key_ctx, started_at, model, false, StatusCode::OK, Some(api_result.credential_id), billed_input_tokens as i64, output_tokens as i64, None);
+    let mut details = upstream_details_base;
+    details.upstream_response_body = Some(compact_log_body(&upstream_response_body));
+    details.response_body = serde_json::to_string_pretty(&response_body).ok().map(compact_log_body);
+    log_request(state, api_key_ctx, started_at, model, false, StatusCode::OK, Some(credential_id), billed_input_tokens as i64, output_tokens as i64, None, Some(details));
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1196,6 +1250,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    let client_request_body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1262,7 +1317,7 @@ pub async fn post_messages_cc(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
-            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::BAD_REQUEST, None, input_tokens as i64, 0, Some(message.clone()));
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::BAD_REQUEST, None, input_tokens as i64, 0, Some(message.clone()), Some(request_details("/cc/v1/messages", &client_request_body)));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -1281,7 +1336,7 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::INTERNAL_SERVER_ERROR, None, input_tokens as i64, 0, Some(e.to_string()));
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::INTERNAL_SERVER_ERROR, None, input_tokens as i64, 0, Some(e.to_string()), Some(request_details("/cc/v1/messages", &client_request_body)));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -1327,6 +1382,7 @@ pub async fn post_messages_cc(
             &api_key_ctx,
             started_at,
             provider,
+            &client_request_body,
             &request_body,
             &payload.model,
             input_tokens,

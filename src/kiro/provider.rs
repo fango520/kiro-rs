@@ -24,6 +24,10 @@ use parking_lot::Mutex;
 pub struct ApiCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    pub upstream_url: String,
+    pub upstream_method: String,
+    pub upstream_status: u16,
+    pub upstream_request_body: String,
 }
 
 /// 每个凭据的最大重试次数
@@ -630,7 +634,7 @@ impl KiroProvider {
             let base = self
                 .client_for(&credentials)?
                 .post(&url)
-                .body(body)
+                .body(body.clone())
                 .header("content-type", "application/json")
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
@@ -662,6 +666,10 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    upstream_url: url,
+                    upstream_method: "POST".to_string(),
+                    upstream_status: status.as_u16(),
+                    upstream_request_body: body,
                 });
             }
 

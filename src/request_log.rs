@@ -8,11 +8,42 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const MAX_LOG_BODY_CHARS: usize = 16_000;
+
+fn default_stage() -> String {
+    "key".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogDetails {
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub request_body: Option<String>,
+    #[serde(default)]
+    pub response_body: Option<String>,
+    #[serde(default)]
+    pub upstream_url: Option<String>,
+    #[serde(default)]
+    pub upstream_method: Option<String>,
+    #[serde(default)]
+    pub upstream_status: Option<u16>,
+    #[serde(default)]
+    pub upstream_request_body: Option<String>,
+    #[serde(default)]
+    pub upstream_response_body: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLogEntry {
     pub id: String,
     pub timestamp: String,
+    #[serde(default = "default_stage")]
+    pub stage: String,
     pub api_key_id: String,
     pub api_key_name: String,
     pub api_key_prefix: String,
@@ -26,6 +57,8 @@ pub struct RequestLogEntry {
     pub total_tokens: i64,
     pub duration_ms: u128,
     pub error: Option<String>,
+    #[serde(default)]
+    pub details: RequestLogDetails,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +101,7 @@ impl RequestLogStore {
     pub fn record(&self, mut entry: RequestLogEntry) {
         if entry.id.is_empty() { entry.id = Uuid::new_v4().to_string(); }
         if entry.timestamp.is_empty() { entry.timestamp = Utc::now().to_rfc3339(); }
+        if entry.stage.is_empty() { entry.stage = default_stage(); }
         entry.total_tokens = entry.input_tokens.saturating_add(entry.output_tokens);
         {
             let mut entries = self.entries.lock();
@@ -95,6 +129,20 @@ impl RequestLogStore {
         let entries = self.entries.lock();
         summarize(entries.iter())
     }
+}
+
+pub fn compact_log_body(raw: impl AsRef<str>) -> String {
+    let raw = raw.as_ref();
+    let compacted = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| raw.to_string());
+
+    let mut result: String = compacted.chars().take(MAX_LOG_BODY_CHARS).collect();
+    if compacted.chars().count() > MAX_LOG_BODY_CHARS {
+        result.push_str("\n... [truncated]");
+    }
+    result
 }
 
 fn summarize<'a>(entries: impl Iterator<Item=&'a RequestLogEntry>) -> RequestLogSummary {

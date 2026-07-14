@@ -1,5 +1,5 @@
-﻿import { useState } from 'react'
-import { Activity, FileUp, KeyRound, LayoutDashboard, ListChecks, LogOut, Moon, Plus, RefreshCw, RotateCw, Server, Sun, Trash2, Upload, Wallet } from 'lucide-react'
+import { Fragment, useState } from 'react'
+import { Activity, ChevronDown, ChevronRight, FileUp, KeyRound, LayoutDashboard, ListChecks, LogOut, Moon, Plus, RefreshCw, RotateCw, Server, Sun, Trash2, Upload, Wallet } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -169,5 +169,43 @@ function KeysPanel(p: { apiKeys: ApiKeyView[]; keyName: string; newKey: string |
 }
 
 function LogsPanel({ logs }: { logs: RequestLogEntry[] }) {
-  return <Card><CardHeader><CardTitle>请求日志</CardTitle></CardHeader><CardContent><div className="overflow-auto rounded-md border"><table className="w-full text-sm"><thead className="bg-muted/50"><tr><th className="p-3 text-left">时间</th><th className="p-3 text-left">Key</th><th className="p-3 text-left">模型</th><th className="p-3 text-left">状态</th><th className="p-3 text-left">模式</th><th className="p-3 text-left">凭据</th><th className="p-3 text-left">Tokens</th><th className="p-3 text-left">耗时</th><th className="p-3 text-left">错误</th></tr></thead><tbody>{logs.map(log => <tr key={log.id} className="border-t"><td className="p-3 whitespace-nowrap">{timeAgo(log.timestamp)}</td><td className="p-3"><div>{log.apiKeyName}</div><div className="text-xs text-muted-foreground font-mono">{log.apiKeyPrefix}</div></td><td className="p-3">{log.model}</td><td className="p-3"><Badge variant={log.success ? 'success' : 'destructive'}>{log.status}</Badge></td><td className="p-3">{log.stream ? 'stream' : 'json'}</td><td className="p-3">{log.credentialId ? `#${log.credentialId}` : '-'}</td><td className="p-3">{fmt(log.totalTokens)}<div className="text-xs text-muted-foreground">in {fmt(log.inputTokens)} / out {fmt(log.outputTokens)}</div></td><td className="p-3">{log.durationMs}ms</td><td className="p-3 max-w-sm truncate text-red-500">{log.error || '-'}</td></tr>)}</tbody></table>{logs.length === 0 && <div className="p-8 text-center text-muted-foreground">暂无请求日志</div>}</div></CardContent></Card>
+  const [openId, setOpenId] = useState<string | null>(null)
+  return <Card><CardHeader><CardTitle>请求日志</CardTitle></CardHeader><CardContent><div className="overflow-auto rounded-md border"><table className="w-full text-sm"><thead className="bg-muted/50"><tr><th className="p-3 text-left w-12">详情</th><th className="p-3 text-left">时间</th><th className="p-3 text-left">Key</th><th className="p-3 text-left">模型</th><th className="p-3 text-left">状态</th><th className="p-3 text-left">模式</th><th className="p-3 text-left">凭据</th><th className="p-3 text-left">Tokens</th><th className="p-3 text-left">耗时</th><th className="p-3 text-left">错误</th></tr></thead><tbody>{logs.map(log => {
+    const open = openId === log.id
+    return <Fragment key={log.id}>
+      <tr className="border-t">
+        <td className="p-3"><Button size="icon" variant="ghost" title="查看详情" onClick={() => setOpenId(open ? null : log.id)}>{open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}</Button></td>
+        <td className="p-3 whitespace-nowrap">{timeAgo(log.timestamp)}</td>
+        <td className="p-3"><div>{log.apiKeyName}</div><div className="text-xs text-muted-foreground font-mono">{log.apiKeyPrefix}</div></td>
+        <td className="p-3">{log.model}</td>
+        <td className="p-3"><Badge variant={log.success ? 'success' : 'destructive'}>{log.status}</Badge>{log.details?.upstreamStatus && <div className="text-xs text-muted-foreground mt-1">上游 {log.details.upstreamStatus}</div>}</td>
+        <td className="p-3">{log.stream ? 'stream' : 'json'}</td>
+        <td className="p-3">{log.credentialId ? `#${log.credentialId}` : '-'}</td>
+        <td className="p-3">{fmt(log.totalTokens)}<div className="text-xs text-muted-foreground">in {fmt(log.inputTokens)} / out {fmt(log.outputTokens)}</div></td>
+        <td className="p-3">{log.durationMs}ms</td>
+        <td className="p-3 max-w-sm truncate text-red-500">{log.error || '-'}</td>
+      </tr>
+      {open && <tr className="border-t bg-muted/20"><td colSpan={10} className="p-4"><LogDetail log={log} /></td></tr>}
+    </Fragment>
+  })}</tbody></table>{logs.length === 0 && <div className="p-8 text-center text-muted-foreground">暂无请求日志</div>}</div></CardContent></Card>
+}
+
+function LogDetail({ log }: { log: RequestLogEntry }) {
+  const d = log.details || {}
+  return <div className="grid gap-4 xl:grid-cols-2">
+    <LogBlock title="Key 端请求" meta={`${d.method || 'POST'} ${d.path || '/v1/messages'} · HTTP ${log.status}`} body={d.requestBody || '暂无请求体'} />
+    <LogBlock title="Key 端返回" meta={`状态 ${log.status} · ${log.durationMs}ms`} body={d.responseBody || log.error || '流式请求未缓存最终 SSE 响应体'} tone={log.success ? 'default' : 'error'} />
+    <LogBlock title="Kiro 反代请求" meta={`${d.upstreamMethod || 'POST'} ${d.upstreamUrl || '-'} · 凭据 ${log.credentialId ? `#${log.credentialId}` : '-'}`} body={d.upstreamRequestBody || '暂无上游请求体'} />
+    <LogBlock title="Kiro 上游返回" meta={`上游状态 ${d.upstreamStatus || '-'} · ${log.stream ? 'stream' : 'json'}`} body={d.upstreamResponseBody || log.error || '流式上游响应体未缓存'} tone={d.upstreamStatus && d.upstreamStatus >= 400 ? 'error' : 'default'} />
+  </div>
+}
+
+function LogBlock({ title, meta, body, tone = 'default' }: { title: string; meta: string; body: string; tone?: 'default' | 'error' }) {
+  return <div className="rounded-md border bg-background">
+    <div className="border-b p-3">
+      <div className="font-medium">{title}</div>
+      <div className="text-xs text-muted-foreground break-all mt-1">{meta}</div>
+    </div>
+    <pre className={`max-h-96 overflow-auto whitespace-pre-wrap break-words p-3 text-xs ${tone === 'error' ? 'text-red-600' : ''}`}>{body}</pre>
+  </div>
 }

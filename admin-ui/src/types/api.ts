@@ -116,6 +116,7 @@ export interface CreateApiKeyRequest {
 export interface RequestLogEntry {
   id: string
   timestamp: string
+  stage: string
   apiKeyId: string
   apiKeyName: string
   apiKeyPrefix: string
@@ -129,6 +130,19 @@ export interface RequestLogEntry {
   totalTokens: number
   durationMs: number
   error?: string | null
+  details: RequestLogDetails
+}
+
+export interface RequestLogDetails {
+  method?: string | null
+  path?: string | null
+  requestBody?: string | null
+  responseBody?: string | null
+  upstreamUrl?: string | null
+  upstreamMethod?: string | null
+  upstreamStatus?: number | null
+  upstreamRequestBody?: string | null
+  upstreamResponseBody?: string | null
 }
 
 export interface RequestLogSummary {
