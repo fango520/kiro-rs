@@ -2,17 +2,73 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
+
+use std::collections::HashMap;
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, CreateApiKeyRequest, SetApiKeyEnabledRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
+
+
+/// GET /api/admin/api-keys
+pub async fn list_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_api_keys())
+}
+
+/// POST /api/admin/api-keys
+pub async fn create_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.create_api_key(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/api-keys/:id/enabled
+pub async fn set_api_key_enabled(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<SetApiKeyEnabledRequest>,
+) -> impl IntoResponse {
+    match state.service.set_api_key_enabled(&id, payload.enabled) {
+        Ok(_) => Json(SuccessResponse::new("API Key 状态已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/api-keys/:id
+pub async fn delete_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_api_key(&id) {
+        Ok(_) => Json(SuccessResponse::new("API Key 已删除")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/logs/requests
+pub async fn list_request_logs(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+    Json(state.service.list_request_logs(limit))
+}
+
+/// GET /api/admin/logs/summary
+pub async fn request_log_summary(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.request_log_summary())
+}
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态

@@ -3,6 +3,8 @@
 use std::convert::Infallible;
 
 use crate::kiro::model::events::Event;
+use crate::api_keys::ApiKeyContext;
+use crate::request_log::RequestLogEntry;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
@@ -10,14 +12,14 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -38,6 +40,44 @@ struct CacheUsageContext {
     cache_creation_1h_input_tokens: i32,
     cache_creation_ttl_known: bool,
     prefix_hit_input_jitter: i32,
+}
+
+
+fn truncate_error(value: impl ToString) -> String {
+    let value = value.to_string();
+    value.chars().take(500).collect()
+}
+
+fn log_request(
+    state: &AppState,
+    api_key_ctx: &ApiKeyContext,
+    started_at: Instant,
+    model: &str,
+    stream: bool,
+    status: StatusCode,
+    credential_id: Option<u64>,
+    input_tokens: i64,
+    output_tokens: i64,
+    error: Option<String>,
+) {
+    state.api_key_store.record_usage(&api_key_ctx.id, input_tokens, output_tokens);
+    state.request_log_store.record(RequestLogEntry {
+        id: String::new(),
+        timestamp: String::new(),
+        api_key_id: api_key_ctx.id.clone(),
+        api_key_name: api_key_ctx.name.clone(),
+        api_key_prefix: api_key_ctx.key_prefix.clone(),
+        model: model.to_string(),
+        stream,
+        status: status.as_u16(),
+        success: status.is_success(),
+        credential_id,
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        duration_ms: started_at.elapsed().as_millis(),
+        error,
+    });
 }
 
 fn build_cache_profile(
@@ -459,8 +499,10 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(api_key_ctx): Extension<ApiKeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let started_at = Instant::now();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -473,6 +515,7 @@ pub async fn post_messages(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::SERVICE_UNAVAILABLE, None, 0, 0, Some("Kiro API provider not configured".to_string()));
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -533,6 +576,7 @@ pub async fn post_messages(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::BAD_REQUEST, None, input_tokens as i64, 0, Some(message.clone()));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -551,6 +595,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::INTERNAL_SERVER_ERROR, None, input_tokens as i64, 0, Some(e.to_string()));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -576,6 +621,9 @@ pub async fn post_messages(
     if payload.stream {
         // 流式响应
         handle_stream_request(
+            &state,
+            &api_key_ctx,
+            started_at,
             provider,
             &request_body,
             &payload.model,
@@ -592,6 +640,9 @@ pub async fn post_messages(
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
+            &state,
+            &api_key_ctx,
+            started_at,
             provider,
             &request_body,
             &payload.model,
@@ -609,6 +660,9 @@ pub async fn post_messages(
 
 /// 处理流式请求
 async fn handle_stream_request(
+    state: &AppState,
+    api_key_ctx: &ApiKeyContext,
+    started_at: Instant,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
@@ -621,8 +675,13 @@ async fn handle_stream_request(
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let error = truncate_error(&e);
+            log_request(state, api_key_ctx, started_at, model, true, StatusCode::BAD_GATEWAY, None, input_tokens as i64, 0, Some(error));
+            return map_provider_error(e);
+        }
     };
+    log_request(state, api_key_ctx, started_at, model, true, StatusCode::OK, Some(api_result.credential_id), input_tokens as i64, 0, None);
 
     let final_cache_context = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
@@ -776,6 +835,9 @@ use super::converter::get_context_window_size;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
+    state: &AppState,
+    api_key_ctx: &ApiKeyContext,
+    started_at: Instant,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
@@ -788,7 +850,11 @@ async fn handle_non_stream_request(
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let error = truncate_error(&e);
+            log_request(state, api_key_ctx, started_at, model, false, StatusCode::BAD_GATEWAY, None, input_tokens as i64, 0, Some(error));
+            return map_provider_error(e);
+        }
     };
 
     let final_cache_context = match (cache_tracker, cache_profile) {
@@ -811,6 +877,7 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
+            log_request(state, api_key_ctx, started_at, model, false, StatusCode::BAD_GATEWAY, Some(api_result.credential_id), input_tokens as i64, 0, Some(e.to_string()));
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -1042,6 +1109,7 @@ async fn handle_non_stream_request(
         })
     };
 
+    log_request(state, api_key_ctx, started_at, model, false, StatusCode::OK, Some(api_result.credential_id), billed_input_tokens as i64, output_tokens as i64, None);
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1117,8 +1185,10 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(api_key_ctx): Extension<ApiKeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let started_at = Instant::now();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -1192,6 +1262,7 @@ pub async fn post_messages_cc(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::BAD_REQUEST, None, input_tokens as i64, 0, Some(message.clone()));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -1210,6 +1281,7 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
+            log_request(&state, &api_key_ctx, started_at, &payload.model, payload.stream, StatusCode::INTERNAL_SERVER_ERROR, None, input_tokens as i64, 0, Some(e.to_string()));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -1251,6 +1323,9 @@ pub async fn post_messages_cc(
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
+            &state,
+            &api_key_ctx,
+            started_at,
             provider,
             &request_body,
             &payload.model,

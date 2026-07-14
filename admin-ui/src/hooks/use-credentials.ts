@@ -10,6 +10,11 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getApiKeys,
+  createApiKey,
+  setApiKeyEnabled,
+  deleteApiKey,
+  getRequestLogs,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -116,5 +121,46 @@ export function useSetLoadBalancingMode() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
+  })
+}
+
+
+export function useApiKeys() {
+  return useQuery({
+    queryKey: ['apiKeys'],
+    queryFn: getApiKeys,
+    refetchInterval: 30000,
+  })
+}
+
+export function useCreateApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: createApiKey,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['apiKeys'] }),
+  })
+}
+
+export function useSetApiKeyEnabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => setApiKeyEnabled(id, enabled),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['apiKeys'] }),
+  })
+}
+
+export function useDeleteApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: deleteApiKey,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['apiKeys'] }),
+  })
+}
+
+export function useRequestLogs() {
+  return useQuery({
+    queryKey: ['requestLogs'],
+    queryFn: () => getRequestLogs(100),
+    refetchInterval: 15000,
   })
 }

@@ -25,7 +25,7 @@
 mod cache_tracker;
 mod converter;
 mod handlers;
-mod middleware;
+pub(crate) mod middleware;
 mod router;
 mod stream;
 pub mod types;

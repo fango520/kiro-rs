@@ -9,6 +9,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::api_keys::{ApiKeyStore, ApiKeyView, CreatedApiKey, CreateApiKeyRequest};
+use crate::request_log::{RequestLogStore, RequestLogListResponse, RequestLogSummary};
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
@@ -38,12 +40,16 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    api_key_store: ApiKeyStore,
+    request_log_store: RequestLogStore,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        api_key_store: ApiKeyStore,
+        request_log_store: RequestLogStore,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -56,7 +62,42 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            api_key_store,
+            request_log_store,
         }
+    }
+
+    /// 获取 API Key 列表
+    pub fn list_api_keys(&self) -> Vec<ApiKeyView> {
+        self.api_key_store.list()
+    }
+
+    /// 创建新的 API Key
+    pub fn create_api_key(&self, req: CreateApiKeyRequest) -> Result<CreatedApiKey, AdminServiceError> {
+        if req.name.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential("API Key 名称不能为空".to_string()));
+        }
+        Ok(self.api_key_store.create(req.name))
+    }
+
+    /// 启用/禁用 API Key
+    pub fn set_api_key_enabled(&self, id: &str, enabled: bool) -> Result<(), AdminServiceError> {
+        self.api_key_store.set_enabled(id, enabled).map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
+    /// 删除 API Key
+    pub fn delete_api_key(&self, id: &str) -> Result<(), AdminServiceError> {
+        self.api_key_store.delete(id).map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
+    /// 请求日志列表
+    pub fn list_request_logs(&self, limit: usize) -> RequestLogListResponse {
+        self.request_log_store.list(limit)
+    }
+
+    /// 请求统计摘要
+    pub fn request_log_summary(&self) -> RequestLogSummary {
+        self.request_log_store.summary()
     }
 
     /// 获取所有凭据状态

@@ -474,6 +474,21 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                if endpoint.is_account_suspended(&body) {
+                    tracing::error!(
+                        "凭据 #{} 已被 Kiro 官方暂停/封禁: {} {}",
+                        ctx.id,
+                        status,
+                        body
+                    );
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -689,6 +704,31 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                if endpoint.is_account_suspended(&body) {
+                    tracing::error!(
+                        "凭据 #{} 已被 Kiro 官方暂停/封禁: {} {}",
+                        ctx.id,
+                        status,
+                        body
+                    );
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,

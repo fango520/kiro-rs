@@ -572,6 +572,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// Kiro 官方封禁/暂停账号
+    AccountSuspended,
 }
 
 /// 统计数据持久化条目
@@ -1530,6 +1532,50 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据已被 Kiro 官方封禁/暂停
+    ///
+    /// 立即禁用该凭据，避免在同一请求内重复重试并误记为 TooManyFailures。
+    pub fn report_account_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            tracing::error!("凭据 #{} 已被 Kiro 官方暂停/封禁，已禁用", id);
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -1739,6 +1785,7 @@ impl MultiTokenManager {
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                             DisabledReason::InvalidConfig => "InvalidConfig",
+                            DisabledReason::AccountSuspended => "AccountSuspended",
                         }
                         .to_string()
                     }),

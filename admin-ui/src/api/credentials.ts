@@ -8,6 +8,10 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  ApiKeyView,
+  CreatedApiKey,
+  RequestLogListResponse,
+  RequestLogSummary,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +106,36 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+
+export async function getApiKeys(): Promise<ApiKeyView[]> {
+  const { data } = await api.get<ApiKeyView[]>('/api-keys')
+  return data
+}
+
+export async function createApiKey(name: string): Promise<CreatedApiKey> {
+  const { data } = await api.post<CreatedApiKey>('/api-keys', { name })
+  return data
+}
+
+export async function setApiKeyEnabled(id: string, enabled: boolean): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/api-keys/${id}/enabled`, { enabled })
+  return data
+}
+
+export async function deleteApiKey(id: string): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/api-keys/${id}`)
+  return data
+}
+
+export async function getRequestLogs(limit = 100): Promise<RequestLogListResponse> {
+  const { data } = await api.get<RequestLogListResponse>('/logs/requests', { params: { limit } })
+  return data
+}
+
+export async function getRequestLogSummary(): Promise<RequestLogSummary> {
+  const { data } = await api.get<RequestLogSummary>('/logs/summary')
   return data
 }

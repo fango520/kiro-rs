@@ -7,8 +7,9 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
+        add_credential, create_api_key, delete_api_key, delete_credential, force_refresh_token,
+        get_all_credentials, get_credential_balance, get_load_balancing_mode, list_api_keys,
+        list_request_logs, request_log_summary, reset_failure_count, set_api_key_enabled,
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -38,6 +39,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        .route("/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/api-keys/{id}", delete(delete_api_key))
+        .route("/api-keys/{id}/enabled", post(set_api_key_enabled))
+        .route("/logs/requests", get(list_request_logs))
+        .route("/logs/summary", get(request_log_summary))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))

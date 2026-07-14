@@ -78,6 +78,11 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_bearer_token_invalid(&self, body: &str) -> bool {
         default_is_bearer_token_invalid(body)
     }
+
+    /// 判断响应体是否表示"账号被 Kiro 官方封禁/暂停"
+    fn is_account_suspended(&self, body: &str) -> bool {
+        default_is_account_suspended(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -125,6 +130,12 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
 }
 
+/// 默认的账号封禁/暂停判断逻辑
+pub fn default_is_account_suspended(body: &str) -> bool {
+    body.contains("temporarily is suspended")
+        || body.contains("locked your account as a security precaution")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +164,13 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
+    }
+
+    #[test]
+    fn test_default_account_suspended() {
+        assert!(default_is_account_suspended(
+            r#"{"message":"Your User ID (xxx) temporarily is suspended. We've locked your account as a security precaution."}"#
+        ));
+        assert!(!default_is_account_suspended("unrelated error"));
     }
 }

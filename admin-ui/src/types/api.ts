@@ -91,3 +91,56 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+
+export interface ApiKeyView {
+  id: string
+  name: string
+  keyPrefix: string
+  enabled: boolean
+  createdAt: string
+  lastUsedAt: string | null
+  requestCount: number
+  inputTokens: number
+  outputTokens: number
+}
+
+export interface CreatedApiKey extends ApiKeyView {
+  key: string
+}
+
+export interface CreateApiKeyRequest {
+  name: string
+}
+
+export interface RequestLogEntry {
+  id: string
+  timestamp: string
+  apiKeyId: string
+  apiKeyName: string
+  apiKeyPrefix: string
+  model: string
+  stream: boolean
+  status: number
+  success: boolean
+  credentialId: number | null
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  durationMs: number
+  error?: string | null
+}
+
+export interface RequestLogSummary {
+  requestCount: number
+  successCount: number
+  errorCount: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+}
+
+export interface RequestLogListResponse {
+  logs: RequestLogEntry[]
+  summary: RequestLogSummary
+}

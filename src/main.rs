@@ -1,10 +1,12 @@
 mod admin;
+mod api_keys;
 mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod request_log;
 pub mod token;
 
 use std::collections::HashMap;
@@ -17,6 +19,8 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use api_keys::ApiKeyStore;
+use request_log::RequestLogStore;
 
 #[tokio::main]
 async fn main() {
@@ -125,6 +129,13 @@ async fn main() {
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
+    let config_dir = std::path::Path::new(&config_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let api_key_store = ApiKeyStore::new(&config_dir, api_key.clone());
+    let request_log_store = RequestLogStore::new(&config_dir, 1000);
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -156,7 +167,8 @@ async fn main() {
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
-        &api_key,
+        api_key_store.clone(),
+        request_log_store.clone(),
         Some(kiro_provider),
         config.extract_thinking,
         config.prompt_cache_ttl_seconds,
@@ -176,8 +188,12 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                api_key_store.clone(),
+                request_log_store.clone(),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

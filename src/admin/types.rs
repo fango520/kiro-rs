@@ -219,6 +219,11 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+
+// ============ API Key 管理 ============
+
+pub use crate::api_keys::{CreateApiKeyRequest, SetApiKeyEnabledRequest};
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

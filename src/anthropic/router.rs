@@ -8,6 +8,8 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::api_keys::ApiKeyStore;
+use crate::request_log::RequestLogStore;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -35,14 +37,16 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
+    api_key_store: ApiKeyStore,
+    request_log_store: RequestLogStore,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     prompt_cache_ttl_seconds: u64,
     prompt_cache_accounting_enabled: bool,
 ) -> Router {
     let mut state = AppState::new(
-        api_key,
+        api_key_store,
+        request_log_store,
         extract_thinking,
         prompt_cache_ttl_seconds,
         prompt_cache_accounting_enabled,
